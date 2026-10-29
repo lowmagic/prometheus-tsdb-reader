@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/prometheus/common/model"
+
 	"github.com/junglestyle/prometheus-tsdb-reader/query"
 )
 
@@ -59,23 +61,79 @@ func Info(w io.Writer, s Summary, blocks []Block) error {
 }
 
 // Instant writes an instant query's summary, then its records.
-func Instant(w io.Writer, s Summary, expr string, at time.Time, r *query.Result) error {
+func Instant(w io.Writer, s Summary, expr string, r *query.Result) error {
 	enc := newEncoder(w)
-	warnings := make([]warning, 0, len(r.Annotations))
-	for _, a := range r.Annotations {
-		warnings = append(warnings, warning{Code: "promql", Message: a})
+	summary := instantSummary{summaryHead: headOf(s), Expression: expr, Time: timeOf(r.Time), resultTail: tailOf(r)}
+	if err := enc.Encode(summary); err != nil {
+		return err
 	}
-	summary := instantSummary{
+	return writeResult(enc, r)
+}
+
+// Range writes a range query's summary, then its records.
+func Range(w io.Writer, s Summary, expr string, r *query.Result) error {
+	enc := newEncoder(w)
+	summary := rangeSummary{
 		summaryHead: headOf(s),
 		Expression:  expr,
-		Time:        timeOf(at),
-		Series:      len(r.Series),
-		Points:      r.Points(),
-		Warnings:    warnings,
+		Start:       timeOf(r.Start),
+		End:         timeOf(r.End),
+		Step:        duration(r.Step),
+		resultTail:  tailOf(r),
 	}
 	if err := enc.Encode(summary); err != nil {
 		return err
 	}
+	return writeResult(enc, r)
+}
+
+// Series writes a series listing's summary, then one record per series.
+func Series(w io.Writer, s Summary, l *query.Listing) error {
+	enc := newEncoder(w)
+	summary := seriesSummary{
+		summaryHead: headOf(s),
+		Selectors:   l.Selectors,
+		Start:       timeOf(l.Start),
+		End:         timeOf(l.End),
+		Series:      len(l.Series),
+		Empty:       emptyOf(l.Empty),
+	}
+	if err := enc.Encode(summary); err != nil {
+		return err
+	}
+	for _, ls := range l.Series {
+		if err := enc.Encode(seriesRecord{Kind: "series", Metric: metricOf(ls)}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Labels writes a label listing's summary, then one labels record.
+func Labels(w io.Writer, s Summary, l *query.Listing) error {
+	enc := newEncoder(w)
+	selectors := l.Selectors
+	if selectors == nil {
+		selectors = []string{}
+	}
+	summary := labelsSummary{
+		summaryHead: headOf(s),
+		Selectors:   selectors,
+		Start:       timeOf(l.Start),
+		End:         timeOf(l.End),
+		Empty:       emptyOf(l.Empty),
+	}
+	if err := enc.Encode(summary); err != nil {
+		return err
+	}
+	rec := labelsRecord{Kind: "labels", Names: l.Labels}
+	if l.Name != "" {
+		rec = labelsRecord{Kind: "labels", Name: l.Name, Values: l.Labels}
+	}
+	return enc.Encode(rec)
+}
+
+func writeResult(enc *json.Encoder, r *query.Result) error {
 	switch r.Type {
 	case query.Scalar:
 		return enc.Encode(valueRecord{Kind: "scalar", Value: samplePair(r.Scalar)})
@@ -122,11 +180,56 @@ type summaryHead struct {
 
 type instantSummary struct {
 	summaryHead
-	Expression string    `json:"expression"`
-	Time       timeOf    `json:"time"`
-	Series     int       `json:"series"`
-	Points     int       `json:"points"`
-	Warnings   []warning `json:"warnings"`
+	Expression string `json:"expression"`
+	Time       timeOf `json:"time"`
+	resultTail
+}
+
+type rangeSummary struct {
+	summaryHead
+	Expression string `json:"expression"`
+	Start      timeOf `json:"start"`
+	End        timeOf `json:"end"`
+	Step       string `json:"step"`
+	resultTail
+}
+
+// resultTail is the summary fields a query result ends with.
+type resultTail struct {
+	Series         int       `json:"series"`
+	Points         int       `json:"points"`
+	Empty          *emptyRec `json:"empty"`
+	SampleInterval *string   `json:"sample_interval"`
+	Warnings       []warning `json:"warnings"`
+}
+
+type seriesSummary struct {
+	summaryHead
+	Selectors []string  `json:"selectors"`
+	Start     timeOf    `json:"start"`
+	End       timeOf    `json:"end"`
+	Series    int       `json:"series"`
+	Empty     *emptyRec `json:"empty"`
+}
+
+type labelsSummary struct {
+	summaryHead
+	Selectors []string  `json:"selectors"`
+	Start     timeOf    `json:"start"`
+	End       timeOf    `json:"end"`
+	Empty     *emptyRec `json:"empty"`
+}
+
+type emptyRec struct {
+	Reason    string   `json:"reason"`
+	Selectors []string `json:"selectors"`
+}
+
+type labelsRecord struct {
+	Kind   string   `json:"kind"`
+	Names  []string `json:"names,omitempty"`
+	Name   string   `json:"name,omitempty"`
+	Values []string `json:"values,omitempty"`
 }
 
 type dumpRec struct {
@@ -189,6 +292,29 @@ func headOf(s Summary) summaryHead {
 		WAL:           wal,
 	}
 }
+
+func tailOf(r *query.Result) resultTail {
+	warnings := make([]warning, 0, len(r.Warnings))
+	for _, w := range r.Warnings {
+		warnings = append(warnings, warning{Code: w.Code, Message: w.Message})
+	}
+	tail := resultTail{Series: len(r.Series), Points: r.Points(), Empty: emptyOf(r.Empty), Warnings: warnings}
+	if r.HasSampleInterval {
+		interval := duration(r.SampleInterval)
+		tail.SampleInterval = &interval
+	}
+	return tail
+}
+
+func emptyOf(e *query.Empty) *emptyRec {
+	if e == nil {
+		return nil
+	}
+	return &emptyRec{Reason: e.Reason, Selectors: e.Selectors}
+}
+
+// duration writes a duration as Prometheus does, such as 1m or 1h30m.
+func duration(d time.Duration) string { return model.Duration(d).String() }
 
 func metricOf(ls []query.Label) map[string]string {
 	m := make(map[string]string, len(ls))

@@ -86,13 +86,13 @@ Time flags, on the commands the table above lists:
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--time T` | Instant query evaluation time | the dump's end |
-| `--start T`, `--end T` | Range bounds | `--end` is the dump's end, `--start` is 2h before it |
+| `--start T`, `--end T` | Range bounds | `--end` is the dump's end, `--start` is 2h before `--end`; for `query series` and `query labels`, the whole dump, as the HTTP API's series and label endpoints default to everything stored |
 | `--step D` | Range query step | see [STEP-1](#steps) |
 | `--window D` | The `[W]` range in a named query's `rate` | 5m |
 
 `T` is an RFC 3339 time or a duration such as `6h`, which counts back from the dump's end. The defaults are
 relative to the dump, never to now, because a dump is old and a range ending now is empty
-([QUERY-8](#queries)).
+([QUERY-8](#queries)). A `--start` after `--end` is a bad argument (exit 2).
 
 ## Dumps
 
@@ -176,7 +176,7 @@ from what is readable and says what it left out.
   form engineers know (`3.15.1`), derived from the module version in the binary's build info by the mapping
   ADR-003 gives. A module version the mapping doesn't cover, such as a pseudo-version, is reported as it is.
 - **QUERY-8: Time defaults come from the dump.** `--time` and `--end` default to the dump's end and `--start` to
-  2h before it. A range that doesn't overlap the dump is answered with the empty reason `outside-dump-range`
+  2h before `--end`, or for the listings to the dump's start. A range that doesn't overlap the dump is answered with the empty reason `outside-dump-range`
   ([OUTPUT-4](#output)), never with a silent empty result.
 
 PromQL behaves as the embedded Prometheus release's engine behaves, including its lookback delta, staleness
@@ -283,12 +283,13 @@ same matchers on both sides; with different instances on each side the division 
   | `wal` | `state` (`replayed`, `read` for `info`, which decodes the WAL without replaying it, `skipped`, `failed` or `absent`), `bytes`, `newest` (null when the WAL holds no samples), and on failure `error` and `missing` with `start` and `end` (null when open-ended) ([DAMAGE-3](#damage)) |
   | `gaps` | one entry per corrupt block overlapping the range, with `block`, `start`, `end` and `error` ([DAMAGE-1](#damage)); every block for `info` |
   | `expression` or `expressions` | the expression as evaluated, or for `named` an array of `name` and `promql` |
+  | `selectors` | for `query series` and `query labels`, the selectors as given, in place of an expression |
   | `time`, or `start`, `end` and `step` | the evaluation time or range, and the step that was used |
-  | `series`, `points` | the counts in the result |
+  | `series`, `points` | the counts in the result; a series listing has `series` only, a label listing neither |
   | `truncated` | null, or `limit` (`series` or `points`), `value` and `full` ([LIMIT-3](#limits)) |
-  | `empty` | null, or `reason` and the `selectors` at fault ([OUTPUT-4](#output)) |
+  | `empty` | null, or `reason` and the `selectors` at fault, an empty list for `outside-dump-range` and `empty-evaluation` ([OUTPUT-4](#output)) |
   | `unpaired` | for a `compare` query, the label sets on the left with no match on the right ([NAMED-12](#named-queries)) |
-  | `sample_interval` | [STEP-4](#steps) |
+  | `sample_interval` | [STEP-4](#steps); null when no series had two samples in the window |
   | `warnings` | each with `code` and `message`: the step warnings ([Steps](#steps)) and the engine's own annotations under the code `promql` |
 
 - **OUTPUT-3: Records mirror the HTTP API.** After the summary, one record per line, each with a `kind`:
@@ -309,7 +310,10 @@ same matchers on both sides; with different instances on each side the division 
   when a comparison holds for no series or the two sides of a binary operation share no label set. The four
   are different answers, and the first is the one the web UI gives silently. The tool learns the selector
   facts from a pass over the expression's vector selectors after evaluation ([STEP-4](#steps)); for
-  `no-matching-series` it selects over the dump's whole range and stops at the first match.
+  `no-matching-series` it selects over the dump's whole range and stops at the first match. A selector is
+  named as written, without its offset or `@` modifier. The listings use the same reasons: an empty series
+  listing is `outside-dump-range`, `no-matching-series` or `no-samples-in-range`, and an empty label listing
+  without a selector is `outside-dump-range` or `no-samples-in-range`.
 - **OUTPUT-5: A failed run says why on stdout.** A run that exits 1 or 3 writes one `error` record as its only
   stdout line, with `exit`, `message`, and for exit 3 the `limit` and its `value`.
 
@@ -371,10 +375,16 @@ nothing, since PromQL repeats the last sample at each extra point.
 - **STEP-3: Warn when the step is finer than the data.** When the step is shorter than the observed sample
   interval, the summary warns `step-finer-than-data`, saying the extra points repeat the same samples.
 - **STEP-4: Say what the samples can show.** Every query summary carries `sample_interval`, the median gap
-  between consecutive raw samples of the expression's vector selectors over the query's range (over the
-  lookback window before `--time` for an instant query), so a reader knows the finest view the dump can give.
-  The tool gets it from a pass over the selectors after evaluation, which also serves OUTPUT-4; the pass reads
-  the selectors' samples once more, which on a large WAL costs about what the query did.
+  between consecutive raw samples of the expression's vector selectors over the window the engine reads for
+  the query: the range, or the time for an instant query, widened by the lookback delta, range selectors and
+  offsets. A gap of a second or more is rounded to the second, so scrape jitter doesn't split one interval in
+  two. A reader learns the finest view the dump can give. The tool gets it from a pass over the selectors
+  after evaluation, which also serves OUTPUT-4. The pass doesn't read every sample again: for each series it
+  reads up to 8 gaps at each of 4 points spread evenly across the window, skipping the chunks between them
+  undecoded, so its cost grows with the number of series, not the length of the range. When the median gap
+  differs between those points, as when a scrape interval changed or scrapes stopped partway, the summary
+  warns `sample-interval-varies` with the median at each point, since one interval then misdescribes the
+  window.
 
 ## Fixtures
 

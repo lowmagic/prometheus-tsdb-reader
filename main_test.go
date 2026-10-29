@@ -19,13 +19,14 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/prometheus/common/model"
 
 	"github.com/junglestyle/prometheus-tsdb-reader/dump"
 	"github.com/junglestyle/prometheus-tsdb-reader/internal/fixture"
 )
 
 func TestQueryInstant(t *testing.T) {
-	dumpDir := writeFixture(t)
+	dumpDir := writeFixture(t, 15*time.Second)
 	before := snapshot(t, dumpDir)
 	scratch := t.TempDir()
 
@@ -68,12 +69,14 @@ func TestQueryInstant(t *testing.T) {
 				"end":   end,
 				"root":  ".",
 			},
-			"wal":        map[string]any{"state": "replayed", "newest": end},
-			"expression": "up",
-			"time":       end,
-			"series":     2.0,
-			"points":     2.0,
-			"warnings":   []any{},
+			"wal":             map[string]any{"state": "replayed", "newest": end},
+			"expression":      "up",
+			"time":            end,
+			"series":          2.0,
+			"points":          2.0,
+			"empty":           nil,
+			"sample_interval": "15s",
+			"warnings":        []any{},
 		},
 		{
 			"kind":   "series",
@@ -92,7 +95,7 @@ func TestQueryInstant(t *testing.T) {
 }
 
 func TestScratchInsideDumpIsRefused(t *testing.T) {
-	dumpDir := writeFixture(t)
+	dumpDir := writeFixture(t, 15*time.Second)
 	before := snapshot(t, dumpDir)
 
 	var stdout, stderr bytes.Buffer
@@ -139,10 +142,10 @@ func TestBadArguments(t *testing.T) {
 
 // writeFixture writes the synthetic dump and checks it has a chunks_head/ file, without which a run would
 // pass on a dump whose copy it never made.
-func writeFixture(t *testing.T) string {
+func writeFixture(t *testing.T, interval time.Duration) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := fixture.Write(t.Context(), dir); err != nil {
+	if err := fixture.Write(t.Context(), dir, interval); err != nil {
 		t.Fatalf("fixture.Write(%s) = %v", dir, err)
 	}
 	files, err := os.ReadDir(filepath.Join(dir, "chunks_head"))
@@ -195,7 +198,7 @@ func decodeLines(t *testing.T, out []byte) []map[string]any {
 }
 
 func TestInfoLayouts(t *testing.T) {
-	dumpDir := writeFixture(t)
+	dumpDir := writeFixture(t, 15*time.Second)
 	tests := []struct {
 		name, prefix, root string
 		compress           bool
@@ -245,7 +248,7 @@ func TestInfoLayouts(t *testing.T) {
 
 func TestExtractionIsReused(t *testing.T) {
 	parent := t.TempDir()
-	dumpDir := writeFixture(t)
+	dumpDir := writeFixture(t, 15*time.Second)
 	archive := writeArchive(t, parent, "dump.tar.gz", func(w io.Writer) error {
 		return fixture.Archive(w, dumpDir, "prometheus/", true)
 	})
@@ -365,7 +368,7 @@ func TestRefusedArchives(t *testing.T) {
 func TestRootChoice(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"a", "b"} {
-		if err := fixture.Write(t.Context(), mkdir(t, dir, name)); err != nil {
+		if err := fixture.Write(t.Context(), mkdir(t, dir, name), 15*time.Second); err != nil {
 			t.Fatalf("fixture.Write(%s) = %v", name, err)
 		}
 	}
@@ -432,4 +435,155 @@ func dirNames(t *testing.T, dir string) []string {
 		names = append(names, e.Name())
 	}
 	return names
+}
+
+func TestRangeSteps(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval time.Duration
+		args     []string
+		step     string
+		warning  string // the step warning's code, or "" for none
+	}{
+		{"1m data, default step", time.Minute, nil, "1m", ""},
+		{"1m data, coarse step", time.Minute, []string{"--step", "15m"}, "15m", "step-coarse"},
+		{"1m data, fine step", time.Minute, []string{"--step", "10s"}, "10s", "step-finer-than-data"},
+		{"15s data, default step", 15 * time.Second, nil, "1m", "step-coarse"},
+	}
+	dumps := map[time.Duration]string{
+		time.Minute:      writeFixture(t, time.Minute),
+		15 * time.Second: writeFixture(t, 15*time.Second),
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--dump", dumps[tt.interval], "--scratch", t.TempDir(),
+				"query", "range", "--promql", "up"}, tt.args...)
+			summary := mustRun(t, args...)[0]
+
+			wantEnd := fixture.End().Format(time.RFC3339)
+			if summary["end"] != wantEnd || summary["step"] != tt.step {
+				t.Errorf("run(%q): end %v, step %v; want end %s, step %s", args, summary["end"], summary["step"], wantEnd, tt.step)
+			}
+			if want := model.Duration(tt.interval).String(); summary["sample_interval"] != want {
+				t.Errorf("run(%q): sample_interval = %v, want %s", args, summary["sample_interval"], want)
+			}
+			codes := []string{}
+			warnings, _ := summary["warnings"].([]any)
+			for _, w := range warnings {
+				if code, _ := w.(map[string]any)["code"].(string); strings.HasPrefix(code, "step-") {
+					codes = append(codes, code)
+				}
+			}
+			want := []string{}
+			if tt.warning != "" {
+				want = []string{tt.warning}
+			}
+			if !slices.Equal(codes, want) {
+				t.Errorf("run(%q): step warnings %v, want %v", args, codes, want)
+			}
+		})
+	}
+}
+
+func TestEmptyReasons(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	dayAfter := fixture.End().Add(24 * time.Hour).Format(time.RFC3339)
+	tests := []struct {
+		name      string
+		args      []string
+		reason    string
+		selectors []any
+	}{
+		{"after the dump", []string{"query", "range", "--promql", "up", "--end", dayAfter}, "outside-dump-range", []any{}},
+		{"missing metric", []string{"query", "range", "--promql", "node_load1"}, "no-matching-series", []any{"node_load1"}},
+		{
+			"stopped series", []string{"query", "range", "--promql", `up{instance="node-c"}`},
+			"no-samples-in-range", []any{`up{instance="node-c"}`},
+		},
+		{"comparison", []string{"query", "range", "--promql", "up > 5"}, "empty-evaluation", []any{}},
+		{"instant after the dump", []string{"query", "instant", "--promql", "up", "--time", dayAfter}, "outside-dump-range", []any{}},
+		{"series of a missing metric", []string{"query", "series", "--promql", "node_load1"}, "no-matching-series", []any{"node_load1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir()}, tt.args...)
+			records := mustRun(t, args...)
+			want := map[string]any{"reason": tt.reason, "selectors": tt.selectors}
+			if diff := cmp.Diff(want, records[0]["empty"]); diff != "" {
+				t.Errorf("run(%q): empty (-want +got):\n%s", args, diff)
+			}
+			if len(records) != 1 {
+				t.Errorf("run(%q): %d records after the summary, want none", args, len(records)-1)
+			}
+		})
+	}
+}
+
+func TestListings(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	tests := []struct {
+		name string
+		args []string
+		want []map[string]any
+	}{
+		{
+			"series", []string{"query", "series", "--promql", "up", "--promql", `up{instance="node-b"}`},
+			[]map[string]any{
+				{"kind": "series", "metric": map[string]any{"__name__": "up", "instance": "node-a", "job": "node-exporter"}},
+				{"kind": "series", "metric": map[string]any{"__name__": "up", "instance": "node-b", "job": "node-exporter"}},
+				{"kind": "series", "metric": map[string]any{"__name__": "up", "instance": "node-c", "job": "node-exporter"}},
+			},
+		},
+		{
+			"label names", []string{"query", "labels"},
+			[]map[string]any{{"kind": "labels", "names": []any{"__name__", "instance", "job"}}},
+		},
+		{
+			"label values", []string{"query", "labels", "instance", "--promql", `{instance!="node-a"}`},
+			[]map[string]any{{"kind": "labels", "name": "instance", "values": []any{"node-b", "node-c", "node-d"}}},
+		},
+		{
+			"label values in the last hour", []string{"query", "labels", "instance", "--start", "1h"},
+			[]map[string]any{{"kind": "labels", "name": "instance", "values": []any{"node-a", "node-b", "node-d"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir()}, tt.args...)
+			records := mustRun(t, args...)
+			if records[0]["empty"] != nil {
+				t.Errorf("run(%q): empty = %v, want null", args, records[0]["empty"])
+			}
+			if diff := cmp.Diff(tt.want, records[1:]); diff != "" {
+				t.Errorf("run(%q) records (-want +got):\n%s", args, diff)
+			}
+		})
+	}
+}
+
+func TestSampleIntervalVaries(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"steady", []string{"query", "range", "--promql", "up", "--start", "7h"}, false},
+		{"changing", []string{"query", "range", "--promql", fixture.Irregular, "--start", "7h"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir()}, tt.args...)
+			summary := mustRun(t, args...)[0]
+			warned := false
+			warnings, _ := summary["warnings"].([]any)
+			for _, w := range warnings {
+				warning, _ := w.(map[string]any)
+				warned = warned || warning["code"] == "sample-interval-varies"
+			}
+			if warned != tt.want {
+				t.Errorf("run(%q): sample-interval-varies warned %v, want %v; warnings %v", args, warned, tt.want, warnings)
+			}
+		})
+	}
 }

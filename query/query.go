@@ -22,6 +22,8 @@ const (
 	defaultEvaluationInterval = time.Minute
 	// The engine needs a timeout. A run has no deadline of its own; an interrupt cancels it instead.
 	noTimeout = 24 * time.Hour
+	// How far back an instant selector looks for a sample.
+	lookbackDelta = 5 * time.Minute
 )
 
 // ValueType is a result's type, as the Prometheus HTTP API names it.
@@ -35,7 +37,7 @@ const (
 	String ValueType = "string"
 )
 
-// Result is an evaluated expression.
+// Result is an evaluated expression and what qualifies it.
 type Result struct {
 	Type ValueType
 	// Series holds a vector's or a matrix's series, in the engine's order.
@@ -44,8 +46,37 @@ type Result struct {
 	Scalar Point
 	// String holds a string result.
 	String StringPoint
-	// Annotations are the engine's warnings and infos, sorted.
-	Annotations []string
+
+	// Time is an instant query's evaluation time.
+	Time time.Time
+	// Start, End and Step are a range query's.
+	Start, End time.Time
+	Step       time.Duration
+	// SampleInterval is the median gap between the selectors' raw samples, when HasSampleInterval.
+	SampleInterval    time.Duration
+	HasSampleInterval bool
+	// Empty says why the result is empty, and is nil when it isn't.
+	Empty *Empty
+	// Warnings are the step warnings, the sample interval's, then the engine's annotations, sorted, under the
+	// code "promql".
+	Warnings []Warning
+}
+
+// Empty is why a result is empty, and the selectors at fault.
+type Empty struct {
+	Reason    string
+	Selectors []string
+}
+
+// Warning is something the reader should know about a result, with a code to match on.
+type Warning struct {
+	Code, Message string
+}
+
+// Dump is the data a query runs over and the range of samples it holds.
+type Dump struct {
+	Queryable  storage.Queryable
+	Start, End time.Time
 }
 
 // Points counts the result's points: one per series in a vector, every point in a matrix.
@@ -100,30 +131,75 @@ type Bucket struct {
 
 // Engine evaluates PromQL as a Prometheus server started with default flags does.
 type Engine struct {
-	ng *promql.Engine
+	ng     *promql.Engine
+	parser parser.Parser
 }
 
 // NewEngine returns an engine configured with Prometheus's server defaults.
 func NewEngine() *Engine {
-	return &Engine{ng: promql.NewEngine(promql.EngineOpts{
-		MaxSamples: defaultMaxSamples,
-		Timeout:    noTimeout,
+	p := parser.NewParser(parser.Options{ExperimentalDurationExpr: true})
+	return &Engine{parser: p, ng: promql.NewEngine(promql.EngineOpts{
+		MaxSamples:    defaultMaxSamples,
+		Timeout:       noTimeout,
+		LookbackDelta: lookbackDelta,
 		NoStepSubqueryIntervalFn: func(int64) int64 {
 			return defaultEvaluationInterval.Milliseconds()
 		},
 		// The server always enables these two.
 		EnableAtModifier:     true,
 		EnableNegativeOffset: true,
-		Parser:               parser.NewParser(parser.Options{ExperimentalDurationExpr: true}),
+		Parser:               p,
 	})}
 }
 
-// Instant evaluates expr at t over q.
-func (e *Engine) Instant(ctx context.Context, q storage.Queryable, expr string, t time.Time) (*Result, error) {
-	qry, err := e.ng.NewInstantQuery(ctx, q, nil, expr, t)
+// Instant evaluates expr over d at the time at names.
+func (e *Engine) Instant(ctx context.Context, d Dump, expr string, at Time) (*Result, error) {
+	t := at.At(d.End)
+	qry, err := e.ng.NewInstantQuery(ctx, d.Queryable, nil, expr, t)
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", expr, err)
 	}
+	res, err := execute(ctx, d, qry, expr)
+	if err != nil {
+		return nil, err
+	}
+	res.Time = t
+	return res, nil
+}
+
+// Span is a range query's bounds and step. The zero Span is the 2h before the dump's end at STEP-1's step.
+type Span struct {
+	Start, End Time
+	// Step is the step, or zero for the default.
+	Step time.Duration
+}
+
+// Range evaluates expr over d across span.
+func (e *Engine) Range(ctx context.Context, d Dump, expr string, span Span) (*Result, error) {
+	start, end, err := bounds(d, span.Start, span.End)
+	if err != nil {
+		return nil, err
+	}
+	step := span.Step
+	if step == 0 {
+		step = defaultStep(start, end)
+	}
+	qry, err := e.ng.NewRangeQuery(ctx, d.Queryable, nil, expr, start, end, step)
+	if err != nil {
+		return nil, fmt.Errorf("parse %q: %w", expr, err)
+	}
+	res, err := execute(ctx, d, qry, expr)
+	if err != nil {
+		return nil, err
+	}
+	res.Start, res.End, res.Step = start, end, step
+	res.Warnings = append(stepWarnings(step, res.SampleInterval, res.HasSampleInterval), res.Warnings...)
+	return res, nil
+}
+
+// execute runs a prepared query, then reads its selectors once more for the sample interval and, when the
+// result is empty, the reason.
+func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Result, error) {
 	defer qry.Close()
 	res := qry.Exec(ctx)
 	if res.Err != nil {
@@ -134,9 +210,36 @@ func (e *Engine) Instant(ctx context.Context, q storage.Queryable, expr string, 
 		return nil, err
 	}
 	warnings, infos := res.Warnings.AsStrings(expr, 0, 0)
-	out.Annotations = slices.Concat(warnings, infos)
-	slices.Sort(out.Annotations)
+	annotations := slices.Concat(warnings, infos)
+	slices.Sort(annotations)
+	for _, a := range annotations {
+		out.Warnings = append(out.Warnings, Warning{Code: "promql", Message: a})
+	}
+
+	stmt, ok := qry.Statement().(*parser.EvalStmt)
+	if !ok {
+		return nil, fmt.Errorf("unexpected statement %T", qry.Statement())
+	}
+	sels := selectorsOf(stmt.Expr)
+	mint, maxt := promql.FindMinMaxTime(stmt)
+	sc, err := scan(ctx, d.Queryable, sels, mint, maxt)
+	if err != nil {
+		return nil, err
+	}
+	out.SampleInterval, out.HasSampleInterval = sc.interval()
+	if w, ok := sc.intervalWarning(); ok {
+		out.Warnings = append([]Warning{w}, out.Warnings...)
+	}
+	if out.isEmpty() {
+		if out.Empty, err = explain(ctx, d, sels, mint, maxt, sc.withoutSamples); err != nil {
+			return nil, err
+		}
+	}
 	return out, nil
+}
+
+func (r *Result) isEmpty() bool {
+	return (r.Type == Vector || r.Type == Matrix) && len(r.Series) == 0
 }
 
 func convert(v parser.Value) (*Result, error) {
