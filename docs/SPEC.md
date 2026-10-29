@@ -74,7 +74,7 @@ Global flags:
 | `--dump PATH` | An extracted directory or an archive ([DUMP-1](#dumps)) | required |
 | `--scratch DIR` | The only place the tool writes | the working directory |
 | `--root PATH` | The TSDB root inside the dump, relative to the extracted directory, when [DUMP-3](#dumps) finds more than one | found |
-| `--no-wal` | Don't replay the WAL | off |
+| `--no-wal` | Leave the WAL out of the dump ([DAMAGE-2](#damage)) | off |
 | `--queries FILE` | A named-query file in place of the embedded one ([NAMED-12](#named-queries)) | the embedded file |
 | `--max-extract-bytes N` | Most bytes the tool will write while extracting an archive | 32 GiB |
 | `--max-series N` | Series per result before truncation | 100 |
@@ -126,39 +126,68 @@ relative to the dump, never to now, because a dump is old and a range ending now
   away. A second interrupt stops the run at once and may leave the directory behind. The dump is opened only for
   reading, so a dump on a read-only mount, a USB disk or a container volume works. Scratch needs room for the
   extracted archive plus a copy of `chunks_head/`.
-- **DUMP-5: Say what the dump covers.** `info` reports the dump's start (the earliest block's start, or the WAL's
-  oldest sample a replay keeps when that is earlier) and end (the latest sample in the newest block or the WAL),
+- **DUMP-5: Say what the dump covers.** `info` reports the dump's start (the earliest readable block's start, or
+  the WAL's oldest sample a replay keeps when that is earlier) and end (the latest sample in a readable block or
+  the WAL),
   each block's time range, series count and status, whether the WAL exists, its size, its own newest sample and
   whether it was read, skipped or failed, the gaps, the TSDB root it chose and the PromQL version. The WAL's
   newest sample comes from decoding its records in one pass, not from replaying it, so `info` is cheap in memory
   on any dump; a query makes the same pass before it replays, so its summary reports the same newest sample, at
-  the cost of reading the WAL twice. The newest block's last sample comes from its index, since a block's own end
-  is the end of the range it was cut for. A replay keeps the WAL's samples from the latest end of a block cut
-  from in-order samples, as Prometheus's own open does; a block cut from out-of-order samples, or from only some
-  series, doesn't move that bound, since the WAL still holds the in-order samples in its range. Every query's
-  summary repeats the dump's start and end, so a reader never has to guess why a range is empty. With `--no-wal`,
-  the dump's end for queries is the newest block's end, and the WAL's own range is still reported as the WAL's.
+  the cost of reading the WAL twice. A block's last sample comes from its index, since a block's own end is the
+  end of the range it was cut for. Blocks can overlap, so the tool reads the index of every readable block whose
+  range could hold a later sample than one already found, newest end first; a corrupt newest block leaves the end
+  to the newest readable one or the WAL. A replay keeps the WAL's samples from the latest end of a block cut from
+  in-order samples, as Prometheus's own open does; a block cut from out-of-order samples, or from only some
+  series, doesn't move that bound, since the WAL still holds the in-order samples in its range. Nor does a
+  corrupt block ([DAMAGE-1](#damage)): its `meta.json` may not read, so how it was cut is unknown, and leaving it
+  out lets the WAL fill in what it holds of its range. Every query's summary repeats the dump's start and end, so
+  a reader never has to guess why a range is empty. With `--no-wal`, the dump's end is the newest readable
+  block's last sample for every command, `info` included, and the WAL's own newest sample is still reported as
+  the WAL's.
 
 ## Damage
 
 Dumps are taken from clusters in trouble and often carry a damaged block or an unfinished WAL. The tool answers
 from what is readable and says what it left out.
 
-- **DAMAGE-1: A corrupt block is a gap.** A block the TSDB cannot open is skipped. Its time range is reported as
-  a gap in `info` and in every summary whose query range overlaps it, with the block's directory name and the
-  error, so a flat line through a gap is never mistaken for a quiet cluster. A corrupt block whose ULID a
-  readable block lists among its compaction parents holds nothing the readable one lacks: it is skipped and
-  listed, but is not a gap.
+- **DAMAGE-1: A corrupt block is a gap.** A block the TSDB cannot open is skipped, and so is one whose index
+  fails as the tool reads it for the dump's end ([DUMP-5](#dumps)). Its time range is reported as a gap in `info`
+  and in every summary whose query overlaps it, with the block's directory name and the error, so a flat line
+  through a gap is never mistaken for a quiet cluster. A query overlaps a gap when the gap overlaps its time or
+  range or the window its selectors read ([STEP-4](#steps)); a listing, when the gap overlaps its range. A gap is
+  reported even where the replayed WAL holds samples in its range, since nothing says the WAL holds all of them.
+  The range is the one the block's `meta.json` gives; when that doesn't read, the gap's `start` and `end` are
+  null and it appears in every summary, since it may overlap any range. (Prometheus's own open skips such a
+  block without a word.) A block whose ULID a readable block lists among its compaction parents or sources holds
+  nothing the readable one lacks: it is `superseded`, listed with its error if it has one, and is not a gap.
+  Queries don't read a superseded block that opens either, as Prometheus deletes it once the compacted one
+  exists.
 - **DAMAGE-2: WAL replay is optional.** `--no-wal` skips the WAL. Replay holds the head's samples in memory
   ([Limits](#limits)), and a WAL from a busy cluster can be larger than the host allows. The summary says the
-  WAL was skipped and the dump's end moves back to the newest block.
+  WAL was `skipped` and the dump's end moves back to the newest block's last sample, for `info` as for a query.
+  The tool still decodes the WAL for its size and newest sample, which holds one record at a time. A dump with no
+  WAL reports it `absent`, with the flag or without.
 - **DAMAGE-3: A failed WAL is missing samples, not a failed run.** Prometheus itself, on a WAL read error,
   keeps what it replayed before the error and truncates the WAL after it. The tool keeps the same samples and
   truncates nothing: it answers from the blocks and the replayed part of the WAL, and reports a missing span
   that starts at the newest sample it kept and ends at the newest timestamp the decoding pass of DUMP-5 found
   in any readable WAL record after the error, or is open-ended when it found none. The span holds the newest
-  samples, often the incident window, so the summary says so in words a reader who sees only the first lines
-  will notice, with the error.
+  samples, often the incident window, so the summary's `wal`, which comes before any result, says `failed` and
+  carries the span and the error.
+
+  A read error is a WAL record that the reader can't read, as when its checksum fails, or that doesn't decode.
+  The decoding pass decodes every record type a replay does, so the two fail at the same record, and `info`,
+  which doesn't replay, reports the WAL `failed` from the pass alone. An error opening a segment, rather than
+  reading one, stops Prometheus's replay too, and fails the run. The span starts at the dump's newest sample
+  before the error, in a readable block or a WAL record a replay keeps, the same for `info` and a query. A
+  query's replay also keeps the chunks the head had written to `chunks_head/` before it stopped, which can reach
+  past the error for some series but not others, so a query's dump can end inside the span, and samples in the
+  span are missing for some series. Past the error, the pass reads on from the next record it can find in the
+  same segment and from the start of each later one; it loses a record split across one of the WAL's 32 KiB
+  pages where it picks up again, since a reader must start at a page boundary or a record. When a replay fails
+  where the pass found no error, the span ends at the WAL's newest sample. With `--no-wal` nothing from the WAL
+  is kept, so the WAL is `skipped` whatever the pass found, and stderr names the error. An interrupt during the
+  read or the replay is a cancelled run (exit 1), not a failed WAL.
 
 ## Queries
 
@@ -290,8 +319,8 @@ same matchers on both sides; with different instances on each side the division 
   | `command` | `info`, `query instant`, `query range`, `query series`, `query labels`, `query metadata` or `named NAME` |
   | `promql_version` | [QUERY-7](#queries) |
   | `dump` | `start`, `end` and `root` ([DUMP-5](#dumps)) |
-  | `wal` | `state` (`replayed`, `read` for `info`, which decodes the WAL without replaying it, `skipped`, `failed` or `absent`), `bytes`, `newest` (null when the WAL holds no samples), and on failure `error` and `missing` with `start` and `end` (null when open-ended) ([DAMAGE-3](#damage)) |
-  | `gaps` | one entry per corrupt block overlapping the range, with `block`, `start`, `end` and `error` ([DAMAGE-1](#damage)); every block for `info` |
+  | `wal` | `state` (`replayed`, `read` for `info`, which decodes the WAL without replaying it, `skipped` under `--no-wal`, `failed` when a query's replay or `info`'s decoding hits a read error, or `absent`), `bytes`, `newest` (the newest sample in any readable record; null when the WAL holds no samples), and only when `failed`, `error` and `missing` with `start` (null when the dump holds no sample before the error) and `end` (null when open-ended) ([DAMAGE-3](#damage)) |
+  | `gaps` | one entry per corrupt block the query overlaps, with `block`, `start` and `end` (both null when the block's `meta.json` doesn't read) and `error` ([DAMAGE-1](#damage)); every corrupt block for `info` |
   | `expression` or `expressions` | the expression as evaluated, or for `named` an array of `name` and `promql` |
   | `selectors` | for `query series` and `query labels`, the selectors as given, in place of an expression |
   | `time`, or `start`, `end` and `step` | the evaluation time or range, and the step that was used |
@@ -310,7 +339,7 @@ same matchers on both sides; with different instances on each side the division 
   | `scalar`, `string` | a query whose result isn't a vector | `value` as one `[time, "value"]` pair |
   | `labels` | `query labels` | `names`, or with a `NAME` the `name` and its `values` |
   | `metadata` | `query metadata` | `metric`, `type`, `help` and `unit` |
-  | `block` | `info` | `dir`, `start`, `end` (exclusive, as the block's `meta.json` gives them), `series`, `status` (`ok`, `corrupt` or `superseded`) and `error` |
+  | `block` | `info` | `dir`, `start`, `end` (exclusive, as the block's `meta.json` gives them), `series`, `status` (`ok`, `corrupt` or `superseded`) and `error`; `start`, `end` and `series` are null when `meta.json` doesn't read, and `error` is null for a block that opened. Blocks come in start order, those without a range last |
 
 - **OUTPUT-4: Say why a result is empty.** An empty result's summary carries one `empty` reason and the
   selectors it applies to. `outside-dump-range`: the query's time or range, before the lookback delta, range
@@ -409,10 +438,11 @@ nothing, since PromQL repeats the last sample at each extra point.
 
 ## Fixtures
 
-The repo's test dumps are synthetic, built with Prometheus's `tsdb` package: a few blocks, a WAL with enough
-samples that the head has cut at least one `chunks_head/` file (the chunk mapper creates them lazily, and a
-fixture without one would pass DUMP-4 on a dump that fails), and copies with a block made corrupt, a WAL made
-unreadable partway, and the layouts of DUMP-3. The fixture for QUERY-5 is written with the head's metadata WAL
+The repo's test dumps are synthetic, built with Prometheus's `tsdb` package: a few blocks, a WAL written one
+commit per scrape time as Prometheus writes it, with enough samples that the head has cut at least one
+`chunks_head/` file (the chunk mapper creates them lazily, and a fixture without one would pass DUMP-4 on a dump
+that fails), and copies with a block's index cut short or its `meta.json` unreadable, a compacted block beside
+the blocks it supersedes, a WAL record whose checksum fails partway, and the layouts of DUMP-3. The fixture for QUERY-5 is written with the head's metadata WAL
 records option on. A real dump can't be committed ([Privacy](standards.md#privacy)), so synthetic fixtures
 don't prove:
 

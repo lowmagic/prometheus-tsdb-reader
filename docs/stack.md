@@ -49,7 +49,8 @@ block cut from in-order samples, as Prometheus's own open sets it,
 keeping the head on a replay error because it holds what was replayed before it; `tsdb.NewBlockQuerier` over
 each block and over `tsdb.NewRangeHead`, joined by `storage.NewMergeQuerier`. The newest timestamp and the
 metadata come from one decoding pass over the WAL with `tsdb/wlog`'s segment reader and `tsdb/record`'s
-decoder, which builds no head. The one thing the library would do that the tool doesn't is repair: Prometheus's
+decoder, which builds no head. Past a damaged record the pass starts readers at the next fragment and at page
+boundaries, which relies on the WAL's page size, 32 KiB, that `wlog` doesn't export. The one thing the library would do that the tool doesn't is repair: Prometheus's
 own server truncates a WAL after a read error, and the tool reports the loss instead ([DAMAGE-3](SPEC.md#damage)).
 
 What the choice costs: the Prometheus module is large, so the binary is tens of megabytes and the build pulls

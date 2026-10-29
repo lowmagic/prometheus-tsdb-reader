@@ -4,12 +4,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -70,6 +72,7 @@ func TestQueryInstant(t *testing.T) {
 				"root":  ".",
 			},
 			"wal":             map[string]any{"state": "replayed", "newest": end},
+			"gaps":            []any{},
 			"expression":      "up",
 			"time":            end,
 			"series":          2.0,
@@ -761,5 +764,307 @@ func TestFailedWriteAddsNoRecord(t *testing.T) {
 	if stdout.Len() == 0 || bytes.Contains(stdout.Bytes(), []byte(`"kind":"error"`)) {
 		t.Errorf("run(%q) wrote %d bytes, with an error record: %t; want part of the result and no error record",
 			args, stdout.Len(), bytes.Contains(stdout.Bytes(), []byte(`"kind":"error"`)))
+	}
+}
+
+// at is the fixture's start plus d, as the output writes it.
+func at(d time.Duration) string { return fixture.Start().Add(d).Format(time.RFC3339) }
+
+func fixtureBlocks(t *testing.T, dir string) []string {
+	t.Helper()
+	blocks, err := fixture.Blocks(dir)
+	if err != nil {
+		t.Fatalf("fixture.Blocks(%s) = %v", dir, err)
+	}
+	return blocks
+}
+
+// withoutError checks that m's error is a message and returns m without it, so the rest can be compared.
+func withoutError(t *testing.T, m any) map[string]any {
+	t.Helper()
+	rec, _ := m.(map[string]any)
+	if msg, _ := rec["error"].(string); msg == "" {
+		t.Errorf("%v has error %v, want a message", rec, rec["error"])
+	}
+	out := maps.Clone(rec)
+	delete(out, "error")
+	return out
+}
+
+// sampleCount runs count_over_time over the hour before t for one up series and returns the count.
+func sampleCount(t *testing.T, dumpDir string, end time.Duration) any {
+	t.Helper()
+	records := mustRun(t, "--dump", dumpDir, "--scratch", t.TempDir(), "query", "instant",
+		"--promql", `count_over_time(up{instance="node-a"}[1h])`, "--time", at(end))
+	if len(records) != 2 {
+		return nil
+	}
+	return sampleValue(records[1])
+}
+
+// field returns the value at a path of keys in a decoded record, or nil when there is none.
+func field(rec any, keys ...string) any {
+	for _, k := range keys {
+		m, _ := rec.(map[string]any)
+		rec = m[k]
+	}
+	return rec
+}
+
+// sampleValue returns an instant series record's value, without its time.
+func sampleValue(rec map[string]any) any {
+	if pair, _ := rec["value"].([]any); len(pair) == 2 {
+		return pair[1]
+	}
+	return nil
+}
+
+// A block that doesn't open is skipped, and its range is a gap in every summary whose query reads into it.
+func TestCorruptBlock(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	blocks := fixtureBlocks(t, dumpDir)
+	if err := fixture.CorruptIndex(blocks[0]); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, dumpDir)
+
+	gap := map[string]any{"block": filepath.Base(blocks[0]), "start": at(0), "end": at(2 * time.Hour)}
+	tests := []struct {
+		name string
+		args []string
+		gap  bool
+	}{
+		{"range over the block", []string{"query", "range", "--promql", "up", "--start", "7h"}, true},
+		{"range after the block", []string{"query", "range", "--promql", "up"}, false},
+		{
+			"instant reading into the block",
+			[]string{"query", "instant", "--promql", "count_over_time(up[1h])", "--time", at(150 * time.Minute)}, true,
+		},
+		{"info", []string{"info"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir()}, tt.args...)
+			records := mustRun(t, args...)
+			gaps, _ := records[0]["gaps"].([]any)
+			switch {
+			case !tt.gap && len(gaps) != 0:
+				t.Errorf("run(%q): gaps %v, want none", args, gaps)
+			case tt.gap && len(gaps) != 1:
+				t.Errorf("run(%q): gaps %v, want block %s", args, gaps, gap["block"])
+			case tt.gap:
+				if diff := cmp.Diff(gap, withoutError(t, gaps[0])); diff != "" {
+					t.Errorf("run(%q): gap (-want +got):\n%s", args, diff)
+				}
+			}
+			if tt.args[0] == "query" && len(records) < 2 {
+				t.Errorf("run(%q) = %v, want an answer from the readable blocks", args, records)
+			}
+		})
+	}
+	if diff := cmp.Diff(before, snapshot(t, dumpDir)); diff != "" {
+		t.Errorf("runs changed the dump (-before +after):\n%s", diff)
+	}
+}
+
+// A corrupt block that a readable compacted block lists as a parent holds nothing the compacted one lacks, so it
+// is listed but isn't a gap.
+func TestSupersededBlock(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	blocks := fixtureBlocks(t, dumpDir)
+	compacted, err := fixture.Compact(t.Context(), dumpDir, blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.CorruptIndex(blocks[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	records := mustRun(t, "--dump", dumpDir, "--scratch", t.TempDir(), "info")
+	if gaps, _ := records[0]["gaps"].([]any); len(gaps) != 0 {
+		t.Errorf("info: gaps %v, want none", gaps)
+	}
+	type status struct {
+		Status string
+		Error  bool
+	}
+	statuses := map[string]status{}
+	for _, r := range records[1:] {
+		dir, _ := r["dir"].(string)
+		state, _ := r["status"].(string)
+		statuses[dir] = status{state, r["error"] != nil}
+	}
+	want := map[string]status{
+		filepath.Base(blocks[0]): {"superseded", true},
+		filepath.Base(blocks[1]): {"superseded", false},
+		filepath.Base(compacted): {"ok", false},
+	}
+	if diff := cmp.Diff(want, statuses); diff != "" {
+		t.Errorf("info: block statuses (-want +got):\n%s", diff)
+	}
+
+	records = mustRun(t, "--dump", dumpDir, "--scratch", t.TempDir(), "query", "range", "--promql", "up", "--start", "7h")
+	if gaps, _ := records[0]["gaps"].([]any); len(gaps) != 0 {
+		t.Errorf("query range over the superseded block: gaps %v, want none", gaps)
+	}
+	if got := sampleCount(t, dumpDir, time.Hour); got != "240" {
+		t.Errorf("samples in the superseded block's first hour = %v, want 240 from the compacted block", got)
+	}
+}
+
+// A WAL with a record that can't be read is replayed up to it, and the summary reports the newest samples as
+// missing, up to the newest readable sample after the damage.
+func TestFailedWAL(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	damage := 270 * time.Minute
+	if err := fixture.CorruptWAL(dumpDir, fixture.Start().Add(damage)); err != nil {
+		t.Fatal(err)
+	}
+	kept := at(damage - 15*time.Second)
+	before := snapshot(t, dumpDir)
+
+	// A query's replay also keeps the chunks the head had written to chunks_head/, which run past the damage for
+	// some series, so only info's dump ends where the WAL's readable records do.
+	if end := field(mustRun(t, "--dump", dumpDir, "--scratch", t.TempDir(), "info")[0], "dump", "end"); end != kept {
+		t.Errorf("info: dump.end = %v, want the newest sample before the damage, %s", end, kept)
+	}
+	for _, command := range [][]string{{"info"}, {"query", "instant", "--promql", "up"}} {
+		args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir()}, command...)
+		records := mustRun(t, args...)
+		wal := withoutError(t, records[0]["wal"])
+		delete(wal, "bytes")
+		want := map[string]any{
+			"state":   "failed",
+			"newest":  at(fixture.Span),
+			"missing": map[string]any{"start": kept, "end": at(fixture.Span)},
+		}
+		if diff := cmp.Diff(want, wal); diff != "" {
+			t.Errorf("run(%q): wal (-want +got):\n%s", args, diff)
+		}
+	}
+	// The half hour before the damage is all there.
+	args := []string{"--dump", dumpDir, "--scratch", t.TempDir(), "query", "instant",
+		"--promql", `count_over_time(up{instance="node-a"}[30m])`, "--time", kept}
+	records := mustRun(t, args...)
+	if len(records) != 2 || sampleValue(records[1]) != "120" {
+		t.Errorf("run(%q) = %v, want 120 samples", args, records)
+	}
+	if diff := cmp.Diff(before, snapshot(t, dumpDir)); diff != "" {
+		t.Errorf("runs changed the dump (-before +after):\n%s", diff)
+	}
+}
+
+// --no-wal leaves the WAL out, so the dump ends with its newest block, and the summary says the WAL was skipped.
+func TestNoWAL(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	blockEnd := at(4*time.Hour - 15*time.Second)
+	for _, command := range [][]string{{"info"}, {"query", "instant", "--promql", "up"}} {
+		args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir(), "--no-wal"}, command...)
+		records := mustRun(t, args...)
+		if end := field(records[0], "dump", "end"); end != blockEnd {
+			t.Errorf("run(%q): dump.end = %v, want the newest block's last sample, %s", args, end, blockEnd)
+		}
+		wal, _ := records[0]["wal"].(map[string]any)
+		if wal["state"] != "skipped" || wal["newest"] != at(fixture.Span) {
+			t.Errorf("run(%q): wal = %v, want state skipped and the WAL's own newest sample", args, wal)
+		}
+		if command[0] == "query" && (records[0]["time"] != blockEnd || len(records) != 3) {
+			t.Errorf("run(%q) = %v, want both up series at %s", args, records, blockEnd)
+		}
+	}
+}
+
+// When the newest block is corrupt, the dump ends with the newest readable one, and the corrupt block doesn't
+// bound the replay, so the WAL fills in what it holds of its range.
+func TestCorruptNewestBlock(t *testing.T) {
+	tests := []struct {
+		name    string
+		corrupt func(string) error
+		// known is whether the gap has the block's range.
+		known bool
+	}{
+		{"index", fixture.CorruptIndex, true},
+		{"meta.json", fixture.CorruptMeta, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dumpDir := writeFixture(t, 15*time.Second)
+			blocks := fixtureBlocks(t, dumpDir)
+			if err := tt.corrupt(blocks[1]); err != nil {
+				t.Fatal(err)
+			}
+			// A replay skips WAL samples older than a chunk it loaded from chunks_head/, so without it the WAL is
+			// what fills in the block's range.
+			if err := os.RemoveAll(filepath.Join(dumpDir, "chunks_head")); err != nil {
+				t.Fatal(err)
+			}
+			gap := map[string]any{"block": filepath.Base(blocks[1]), "start": nil, "end": nil}
+			if tt.known {
+				gap["start"], gap["end"] = at(2*time.Hour), at(4*time.Hour)
+			}
+
+			args := []string{"--dump", dumpDir, "--scratch", t.TempDir(), "--no-wal", "query", "range", "--promql", "up",
+				"--start", at(time.Hour), "--end", at(3 * time.Hour)}
+			summary := mustRun(t, args...)[0]
+			if end, want := field(summary, "dump", "end"), at(2*time.Hour-15*time.Second); end != want {
+				t.Errorf("run(%q): dump.end = %v, want the older block's last sample, %s", args, end, want)
+			}
+			if gaps, _ := summary["gaps"].([]any); len(gaps) != 1 {
+				t.Errorf("run(%q): gaps %v, want the corrupt block", args, gaps)
+			} else if diff := cmp.Diff(gap, withoutError(t, gaps[0])); diff != "" {
+				t.Errorf("run(%q): gap (-want +got):\n%s", args, diff)
+			}
+			if got := sampleCount(t, dumpDir, 3*time.Hour); got != "240" {
+				t.Errorf("samples in the corrupt block's range = %v, want 240 from the WAL", got)
+			}
+		})
+	}
+}
+
+// An info record for a block whose meta.json doesn't read has no range or series count.
+func TestUnreadableMetaBlock(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	blocks := fixtureBlocks(t, dumpDir)
+	if err := fixture.CorruptMeta(blocks[0]); err != nil {
+		t.Fatal(err)
+	}
+	records := mustRun(t, "--dump", dumpDir, "--scratch", t.TempDir(), "info")
+	want := map[string]any{
+		"kind": "block", "dir": filepath.Base(blocks[0]), "start": nil, "end": nil, "series": nil, "status": "corrupt",
+	}
+	if diff := cmp.Diff(want, withoutError(t, records[len(records)-1])); diff != "" {
+		t.Errorf("info: last block record (-want +got):\n%s", diff)
+	}
+}
+
+// cancelOn cancels a run when its progress reaches a message.
+type cancelOn struct {
+	msg    string
+	cancel func()
+	bytes.Buffer
+}
+
+func (w *cancelOn) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(w.msg)) {
+		w.cancel()
+	}
+	return w.Buffer.Write(p)
+}
+
+// An interrupt while the WAL is read cancels the run; it is never a WAL that failed partway. (One during a
+// query's replay is too, but the query after it would stop on the cancelled run either way.)
+func TestInterruptedWALRead(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stderr := &cancelOn{msg: `msg="reading WAL"`, cancel: cancel}
+	var stdout bytes.Buffer
+	args := []string{"--dump", dumpDir, "--scratch", t.TempDir(), "info"}
+	if err := run(ctx, args, &stdout, stderr); !errors.Is(err, context.Canceled) {
+		t.Errorf("run(%q) interrupted as it reads the WAL = %v, want it cancelled", args, err)
+	}
+	records := decodeLines(t, stdout.Bytes())
+	if len(records) != 1 || records[0]["kind"] != "error" || records[0]["exit"] != 1.0 {
+		t.Errorf("run(%q) interrupted as it reads the WAL: stdout %v, want one error record with exit 1", args, records)
 	}
 }

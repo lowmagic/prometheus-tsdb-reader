@@ -52,6 +52,9 @@ type Result struct {
 	// Start, End and Step are a range query's.
 	Start, End time.Time
 	Step       time.Duration
+	// ReadStart and ReadEnd bound the samples the query read: its time or range, widened by the lookback delta,
+	// range selectors and offsets.
+	ReadStart, ReadEnd time.Time
 	// SampleInterval is the median gap between the selectors' raw samples, when HasSampleInterval.
 	SampleInterval    time.Duration
 	HasSampleInterval bool
@@ -218,6 +221,8 @@ func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Resul
 	if err != nil {
 		return nil, err
 	}
+	mint, maxt := span(sels)
+	out.ReadStart, out.ReadEnd = timestamp.Time(min(start, mint)).UTC(), timestamp.Time(max(end, maxt)).UTC()
 	warnings, infos := res.Warnings.AsStrings(expr, 0, 0)
 	annotations := slices.Concat(warnings, infos)
 	slices.Sort(annotations)

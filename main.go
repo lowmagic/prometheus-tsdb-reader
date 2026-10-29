@@ -109,6 +109,7 @@ global flags:`
 type config struct {
 	dump     string
 	dumpOpts dump.Options
+	noWAL    bool
 	logger   *slog.Logger
 }
 
@@ -124,6 +125,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	global.StringVar(&cfg.dumpOpts.Scratch, "scratch", ".", "the only `directory` the tool writes under")
 	global.StringVar(&cfg.dumpOpts.Root, "root", "",
 		"the TSDB root `directory`, relative to the dump's, when the dump holds more than one")
+	global.BoolVar(&cfg.noWAL, "no-wal", false,
+		"leave the WAL out: don't replay it, and end the dump with its newest block")
 	global.Int64Var(&cfg.dumpOpts.MaxExtractBytes, "max-extract-bytes", defaultMaxExtractBytes,
 		"the most `bytes` extracting an archive may write")
 	if err := checkSpelling(args); err != nil {
@@ -178,13 +181,14 @@ func info(ctx context.Context, cfg config, args []string, stdout, stderr io.Writ
 	}
 	var blocks []render.Block
 	for _, b := range o.st.Blocks() {
-		blocks = append(blocks, render.Block{Dir: b.Dir, Start: b.Start, End: b.End, Series: b.Series, Status: b.Status})
+		blocks = append(blocks, render.Block{
+			Dir: b.Dir, Known: b.HasMeta, Start: b.Start, End: b.End, Series: b.Series, Status: b.Status, Error: message(b.Err),
+		})
 	}
-	summary, err := o.close("info", nil)
-	if err != nil {
+	if err := o.close(nil); err != nil {
 		return err
 	}
-	return render.Info(stdout, summary, blocks)
+	return render.Info(stdout, o.summary("info", o.st.Gaps()), blocks)
 }
 
 func queryInstant(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
@@ -203,11 +207,10 @@ func queryInstant(ctx context.Context, cfg config, args []string, stdout, stderr
 		return err
 	}
 	res, err := query.NewEngine().Instant(ctx, o.queryDump(), *expr, *at)
-	summary, err := o.close("query instant", err)
-	if err != nil {
+	if err := o.close(err); err != nil {
 		return err
 	}
-	return render.Instant(stdout, summary, *expr, res)
+	return render.Instant(stdout, o.summary("query instant", o.gaps(res.ReadStart, res.ReadEnd)), *expr, res)
 }
 
 func queryRange(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
@@ -237,11 +240,10 @@ func queryRange(ctx context.Context, cfg config, args []string, stdout, stderr i
 		return err
 	}
 	res, err := query.NewEngine().Range(ctx, o.queryDump(), *expr, span)
-	summary, err := o.close("query range", err)
-	if err != nil {
+	if err := o.close(err); err != nil {
 		return err
 	}
-	return render.Range(stdout, summary, *expr, res)
+	return render.Range(stdout, o.summary("query range", o.gaps(res.ReadStart, res.ReadEnd)), *expr, res)
 }
 
 func querySeries(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
@@ -261,11 +263,10 @@ func querySeries(ctx context.Context, cfg config, args []string, stdout, stderr 
 		return err
 	}
 	l, err := query.NewEngine().Series(ctx, o.queryDump(), *selectors, *start, *end)
-	summary, err := o.close("query series", err)
-	if err != nil {
+	if err := o.close(err); err != nil {
 		return err
 	}
-	return render.Series(stdout, summary, l)
+	return render.Series(stdout, o.summary("query series", o.gaps(l.Start, l.End)), l)
 }
 
 func queryLabels(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
@@ -287,11 +288,10 @@ func queryLabels(ctx context.Context, cfg config, args []string, stdout, stderr 
 		return err
 	}
 	l, err := query.NewEngine().Labels(ctx, o.queryDump(), name, *selectors, *start, *end)
-	summary, err := o.close("query labels", err)
-	if err != nil {
+	if err := o.close(err); err != nil {
 		return err
 	}
-	return render.Labels(stdout, summary, l)
+	return render.Labels(stdout, o.summary("query labels", o.gaps(l.Start, l.End)), l)
 }
 
 // deniable reports whether a caller may deny a flag by refusing one argument, so it is accepted in only one
@@ -372,7 +372,7 @@ func (c config) open(ctx context.Context, replay bool) (_ *opened, err error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := store.Open(ctx, d, store.Options{Scratch: c.dumpOpts.Scratch, Replay: replay}, c.logger)
+	st, err := store.Open(ctx, d, store.Options{Scratch: c.dumpOpts.Scratch, Replay: replay, SkipWAL: c.noWAL}, c.logger)
 	if err != nil {
 		return nil, err
 	}
@@ -388,24 +388,53 @@ func (o *opened) queryDump() query.Dump {
 }
 
 // close closes the store, so a failure to close, such as scratch filling as the head writes its chunks, is
-// reported before anything is rendered. It returns the command's summary, or err joined with the close's.
-func (o *opened) close(command string, err error) (render.Summary, error) {
-	summary := o.summary(command)
-	return summary, errors.Join(err, o.st.Close())
+// reported before anything is rendered. It returns err joined with the close's.
+func (o *opened) close(err error) error {
+	return errors.Join(err, o.st.Close())
 }
 
-func (o *opened) summary(command string) render.Summary {
+// gaps returns the dump's gaps that overlap [start, end].
+func (o *opened) gaps(start, end time.Time) []store.Block {
+	var out []store.Block
+	for _, g := range o.st.Gaps() {
+		if g.Overlaps(start, end) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+func (o *opened) summary(command string, gaps []store.Block) render.Summary {
 	version, ok := query.PromQLVersion()
 	if !ok {
 		version = "unknown"
 	}
-	wal := o.st.WAL()
-	return render.Summary{
+	w := o.st.WAL()
+	wal := render.WAL{State: w.State, Bytes: w.Bytes, Newest: w.Newest, Sampled: w.Sampled, Error: message(w.Err)}
+	if w.State == store.WALFailed {
+		m := w.Missing
+		wal.Missing = &render.Missing{Start: m.Start, Started: m.Started, End: m.End, Ended: m.Ended}
+	}
+	summary := render.Summary{
 		Command:       command,
 		PromQLVersion: version,
 		Dump:          render.Dump{Start: o.start, End: o.end, Root: o.d.RootName},
-		WAL:           render.WAL{State: wal.State, Bytes: wal.Bytes, Newest: wal.Newest, Sampled: wal.Sampled},
+		WAL:           wal,
 	}
+	for _, g := range gaps {
+		summary.Gaps = append(summary.Gaps, render.Gap{
+			Block: g.Dir, Known: g.HasMeta, Start: g.Start, End: g.End, Error: message(g.Err),
+		})
+	}
+	return summary
+}
+
+// message is an error's text, or "" for none.
+func message(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // flagError turns a flag package error into a usage error, and a request for help into success.

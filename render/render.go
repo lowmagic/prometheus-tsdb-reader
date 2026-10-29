@@ -13,12 +13,14 @@ import (
 	"github.com/junglestyle/prometheus-tsdb-reader/query"
 )
 
-// Summary is what qualifies every result: what ran, over what dump, with which engine.
+// Summary is what qualifies every result: what ran, over what dump, with which engine, and what the dump is
+// missing.
 type Summary struct {
 	Command       string
 	PromQLVersion string
 	Dump          Dump
 	WAL           WAL
+	Gaps          []Gap
 }
 
 // Dump is the dump's range and the TSDB root the run used.
@@ -27,20 +29,43 @@ type Dump struct {
 	Root       string
 }
 
-// WAL is what the run did with the WAL, its size, and its newest sample when Sampled.
+// WAL is what the run did with the WAL, its size, and its newest sample when Sampled. A WAL that failed has an
+// Error and the span it leaves Missing.
 type WAL struct {
 	State   string
 	Bytes   int64
 	Newest  time.Time
 	Sampled bool
+	Error   string
+	Missing *Missing
 }
 
-// Block is one block as info lists it. End is exclusive.
+// Missing is the span of samples a failed WAL leaves out. Start is unknown unless Started, and the span is
+// open-ended unless Ended.
+type Missing struct {
+	Start   time.Time
+	Started bool
+	End     time.Time
+	Ended   bool
+}
+
+// Block is one block as info lists it. End is exclusive. Start, End and Series are unknown unless Known. Error
+// is why the block didn't open, or "".
 type Block struct {
 	Dir        string
+	Known      bool
 	Start, End time.Time
 	Series     uint64
 	Status     string
+	Error      string
+}
+
+// Gap is a corrupt block's range, which the dump is missing. Start and End are unknown unless Known.
+type Gap struct {
+	Block      string
+	Known      bool
+	Start, End time.Time
+	Error      string
 }
 
 // Info writes info's summary, then one record per block.
@@ -50,8 +75,9 @@ func Info(w io.Writer, s Summary, blocks []Block) error {
 		return err
 	}
 	for _, b := range blocks {
-		rec := blockRecord{
-			Kind: "block", Dir: b.Dir, Start: timeOf(b.Start), End: timeOf(b.End), Series: b.Series, Status: b.Status,
+		rec := blockRecord{Kind: "block", Dir: b.Dir, Status: b.Status, Error: optional(b.Error)}
+		if b.Known {
+			rec.Start, rec.End, rec.Series = timePtr(b.Start), timePtr(b.End), &b.Series
 		}
 		if err := enc.Encode(rec); err != nil {
 			return err
@@ -171,11 +197,12 @@ func newEncoder(w io.Writer) *json.Encoder {
 
 // summaryHead is the summary fields every command writes. Embedded, its fields come first in the record.
 type summaryHead struct {
-	Kind          string  `json:"kind"`
-	Command       string  `json:"command"`
-	PromQLVersion string  `json:"promql_version"`
-	Dump          dumpRec `json:"dump"`
-	WAL           walRec  `json:"wal"`
+	Kind          string   `json:"kind"`
+	Command       string   `json:"command"`
+	PromQLVersion string   `json:"promql_version"`
+	Dump          dumpRec  `json:"dump"`
+	WAL           walRec   `json:"wal"`
+	Gaps          []gapRec `json:"gaps"`
 }
 
 type instantSummary struct {
@@ -239,18 +266,32 @@ type dumpRec struct {
 }
 
 type walRec struct {
-	State  string  `json:"state"`
-	Bytes  int64   `json:"bytes"`
-	Newest *timeOf `json:"newest"`
+	State   string      `json:"state"`
+	Bytes   int64       `json:"bytes"`
+	Newest  *timeOf     `json:"newest"`
+	Error   *string     `json:"error,omitempty"`
+	Missing *missingRec `json:"missing,omitempty"`
+}
+
+type missingRec struct {
+	Start *timeOf `json:"start"`
+	End   *timeOf `json:"end"`
+}
+
+type gapRec struct {
+	Block string  `json:"block"`
+	Start *timeOf `json:"start"`
+	End   *timeOf `json:"end"`
+	Error string  `json:"error"`
 }
 
 type blockRecord struct {
-	Kind   string `json:"kind"`
-	Dir    string `json:"dir"`
-	Start  timeOf `json:"start"`
-	End    timeOf `json:"end"`
-	Series uint64 `json:"series"`
-	Status string `json:"status"`
+	Kind   string  `json:"kind"`
+	Dir    string  `json:"dir"`
+	Start  *timeOf `json:"start"`
+	End    *timeOf `json:"end"`
+	Series *uint64 `json:"series"`
+	Status string  `json:"status"`
 	// Error is the reason a block didn't open; null for one that did.
 	Error *string `json:"error"`
 }
@@ -279,10 +320,26 @@ type errorRecord struct {
 }
 
 func headOf(s Summary) summaryHead {
-	wal := walRec{State: s.WAL.State, Bytes: s.WAL.Bytes}
+	wal := walRec{State: s.WAL.State, Bytes: s.WAL.Bytes, Error: optional(s.WAL.Error)}
 	if s.WAL.Sampled {
-		newest := timeOf(s.WAL.Newest)
-		wal.Newest = &newest
+		wal.Newest = timePtr(s.WAL.Newest)
+	}
+	if m := s.WAL.Missing; m != nil {
+		wal.Missing = &missingRec{}
+		if m.Started {
+			wal.Missing.Start = timePtr(m.Start)
+		}
+		if m.Ended {
+			wal.Missing.End = timePtr(m.End)
+		}
+	}
+	gaps := make([]gapRec, 0, len(s.Gaps))
+	for _, g := range s.Gaps {
+		rec := gapRec{Block: g.Block, Error: g.Error}
+		if g.Known {
+			rec.Start, rec.End = timePtr(g.Start), timePtr(g.End)
+		}
+		gaps = append(gaps, rec)
 	}
 	return summaryHead{
 		Kind:          "summary",
@@ -290,7 +347,21 @@ func headOf(s Summary) summaryHead {
 		PromQLVersion: s.PromQLVersion,
 		Dump:          dumpRec{Start: timeOf(s.Dump.Start), End: timeOf(s.Dump.End), Root: s.Dump.Root},
 		WAL:           wal,
+		Gaps:          gaps,
 	}
+}
+
+// optional is a string that is null when empty.
+func optional(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func timePtr(t time.Time) *timeOf {
+	out := timeOf(t)
+	return &out
 }
 
 func tailOf(r *query.Result) resultTail {
