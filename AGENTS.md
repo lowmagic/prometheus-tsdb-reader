@@ -1,13 +1,16 @@
 # Working on prometheus-tsdb-reader
 
-A Go library and CLI for reading and querying Prometheus TSDB dumps offline.
+Reads a Prometheus TSDB dump offline and answers PromQL the way Prometheus does.
 
 Read before changing behavior:
 
-- [README](README.md): what prometheus-tsdb-reader does and how to run it
-- [Coding standards](docs/standards.md): how the code should read
+- [Specification](docs/SPEC.md): what prometheus-tsdb-reader does, with the requirement IDs the roadmap cites
+- [Roadmap](docs/ROADMAP.md): the order it gets built in, one usable slice at a time
+- [Coding standards](docs/standards.md): how the code should read, and which layer mustn't know what
+- [Stack and decisions](docs/stack.md): Go on Prometheus's own `tsdb` and `promql` packages, and why
+- [README](README.md): what it is and how to run it
 
-Docs live in `docs/` and change with behavior. Never commit hostnames, tokens, or deployment config (see
-Privacy in the [org standards](docs/org-standards.md)).
+Docs live in `docs/` and change with behavior. Never commit hostnames, tokens, or deployment config, and never
+any part of a real dump (see [Privacy](docs/standards.md#privacy)).
 
 `make check` runs everything CI runs, except the org standards check: `make standards` (needs the network).
