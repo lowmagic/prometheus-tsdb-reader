@@ -1,4 +1,4 @@
-<!-- junglestyle/.github code-standards/go.md at b67e538f4a83e8ee7f11716801f1c3d0819be19d. Change it there, then run make sync-standards. -->
+<!-- junglestyle/.github code-standards/go.md at b3d3bb1eb1b997100738fb5bb9dd2a2b9f45a9d4. Change it there, then run make sync-standards. -->
 # Go standards
 
 Decisions for Go code, beneath the org [standards](https://github.com/junglestyle/.github/blob/main/code-standards/README.md). `.golangci.yml` holds the mechanical rules; this file holds what a linter can't check. No junglestyle repo uses Go yet, so every rule here comes from the sources below and the org standards, not from practice.
@@ -19,6 +19,7 @@ Decisions for Go code, beneath the org [standards](https://github.com/junglestyl
 ## Layout
 
 - One module per repo. `go.mod`'s `go` line names the current release.
+- A module's version is its `vX.Y.Z` tag, so it has no manifest version to keep at `0.0.0` or to check a tag against: before its first release it has no tag. From `v2` on, the module path ends in `/vN`, as Go requires. Code that reports the version reads it with `debug.ReadBuildInfo`.
 - One binary: `package main` at the root. Several: `cmd/<name>/main.go` each.
 - Packages that aren't a public API live under `internal/`. No `pkg/` directory.
 - Name a package for what it provides (`queue`, `lease`), never `util`, `common`, `types`, `models` or `helpers`.
