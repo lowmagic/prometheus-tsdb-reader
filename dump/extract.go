@@ -61,6 +61,9 @@ func extract(ctx context.Context, path string, opts Options, logger *slog.Logger
 	if err := x.run(ctx, tr, partial); err != nil {
 		return "", err
 	}
+	for _, name := range x.dangling {
+		logger.Warn("removed a symbolic link that leads nowhere in the archive", "entry", name)
+	}
 	if err := os.Rename(partial, target); err != nil {
 		return "", fmt.Errorf("move extraction into place: %w", err)
 	}
@@ -104,6 +107,8 @@ type extraction struct {
 	entries int
 	written int64
 	links   []string
+	// dangling are the symbolic links removed for resolving to nothing.
+	dangling []string
 }
 
 func (x *extraction) refuse(entry, format string, args ...any) error {
@@ -135,7 +140,7 @@ func (x *extraction) run(ctx context.Context, tr *tar.Reader, dir string) (err e
 		}
 		x.entries++
 	}
-	return x.checkLinks(dir)
+	return x.checkLinks(root, dir)
 }
 
 func (x *extraction) entry(root *os.Root, tr *tar.Reader, hdr *tar.Header) error {
@@ -176,6 +181,11 @@ func (x *extraction) entry(root *os.Root, tr *tar.Reader, hdr *tar.Header) error
 		if !filepath.IsLocal(hdr.Linkname) {
 			return x.refuse(name, "its link target %s leaves the extraction directory", hdr.Linkname)
 		}
+		// A hard link to a symbolic link is a second symbolic link in another directory, where the same target
+		// text can lead somewhere else, so it is refused rather than checked again.
+		if target, err := root.Lstat(hdr.Linkname); err == nil && target.Mode()&os.ModeSymlink != 0 {
+			return x.refuse(name, "its link target %s is a symbolic link", hdr.Linkname)
+		}
 		if err := root.Link(hdr.Linkname, name); err != nil {
 			return fmt.Errorf("extract %s: %w", name, err)
 		}
@@ -194,9 +204,11 @@ func writeFile(root *os.Root, name string, r io.Reader) (_ int64, err error) {
 	return io.Copy(f, r)
 }
 
-// checkLinks refuses a symbolic link that resolves outside dir. A target can stay inside by its text and leave
-// by what it passes through, as with b -> . and a -> b/.., which is the parent of dir.
-func (x *extraction) checkLinks(dir string) error {
+// checkLinks refuses a symbolic link that resolves outside dir, and removes one that resolves to nothing. A
+// target can stay inside by its text and leave by what it passes through, as with b -> . and a -> b/.., which is
+// the parent of dir. A dangling link can lead out the same way, as a -> b/../later does, to a file that appears
+// beside the extraction once it moves under scratch, and it reaches nothing in the archive, so it goes.
+func (x *extraction) checkLinks(root *os.Root, dir string) error {
 	resolvedDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return err
@@ -204,7 +216,11 @@ func (x *extraction) checkLinks(dir string) error {
 	for _, name := range x.links {
 		resolved, err := filepath.EvalSymlinks(filepath.Join(dir, name))
 		if errors.Is(err, os.ErrNotExist) {
-			continue // A dangling link reaches nothing, and its text was checked as it was written.
+			if err := root.Remove(name); err != nil {
+				return fmt.Errorf("remove dangling link %s: %w", name, err)
+			}
+			x.dangling = append(x.dangling, name)
+			continue
 		}
 		if err != nil {
 			return x.refuse(name, "its link target can't be resolved: %v", err)

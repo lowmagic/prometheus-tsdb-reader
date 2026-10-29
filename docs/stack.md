@@ -44,7 +44,8 @@ facts the design must honor are visible, and four of them rule it out:
 
 The pieces it is built from are exported, so the `store` layer assembles the same queryable itself:
 `tsdb.OpenBlock` on each block directory, catching the error per block; `tsdb.NewHead` over `wlog.Open` on the
-dump's `wal/` directory with the chunk directory under scratch, then `Head.Init` from the newest block's end,
+dump's `wal/` directory with the chunk directory under scratch, then `Head.Init` from the latest end of a
+block cut from in-order samples, as Prometheus's own open sets it,
 keeping the head on a replay error because it holds what was replayed before it; `tsdb.NewBlockQuerier` over
 each block and over `tsdb.NewRangeHead`, joined by `storage.NewMergeQuerier`. The newest timestamp and the
 metadata come from one decoding pass over the WAL with `tsdb/wlog`'s segment reader and `tsdb/record`'s

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 )
 
@@ -52,7 +55,8 @@ func (e *Engine) Series(ctx context.Context, d Dump, selectors []string, start, 
 		return nil, err
 	}
 	if len(l.Series) == 0 {
-		l.Empty, err = explain(ctx, d, sels, mint, maxt, sels)
+		// The listing is empty, so no selector matched a series in the range.
+		l.Empty, err = explain(ctx, d, sels, mint, maxt, func() ([]selector, error) { return sels, nil })
 	}
 	return l, err
 }
@@ -97,24 +101,49 @@ func (e *Engine) Labels(ctx context.Context, d Dump, name string, selectors []st
 	}
 	l.Labels = make([]string, 0, len(seen))
 	for f := range seen {
-		l.Labels = append(l.Labels, f)
+		// A block's index hands out strings that live only as long as the block is open.
+		l.Labels = append(l.Labels, strings.Clone(f))
 	}
 	slices.Sort(l.Labels)
 
 	if len(l.Labels) > 0 {
 		return l, nil
 	}
+	// Only a series carrying the label has a value for it, so the reason is found for each selector, or with
+	// none for every series, narrowed to those, and names the narrowed selectors.
+	if name != "" {
+		if len(sels) == 0 {
+			sels = []selector{{}}
+		}
+		for i, sel := range sels {
+			sels[i] = carrying(sel, name)
+		}
+	}
 	if len(sels) == 0 {
-		// With no selector the listing covers every series, so it's empty only where the dump has no samples.
+		// Label names with no selector cover every series, so they're empty only where the dump has no samples.
 		reason := NoSamplesInRange
-		if maxt < d.Start.UnixMilli() || mint > d.End.UnixMilli() {
+		if outsideDump(d, mint, maxt) {
 			reason = OutsideDumpRange
 		}
 		l.Empty = &Empty{Reason: reason, Selectors: []string{}}
 		return l, nil
 	}
-	l.Empty, err = explain(ctx, d, sels, mint, maxt, sels)
+	// The listing is empty, so no selector matched a series in the range.
+	l.Empty, err = explain(ctx, d, sels, mint, maxt, func() ([]selector, error) { return sels, nil })
 	return l, err
+}
+
+// carrying narrows a selector to the series that carry the label name, and names it in the printer's form, as
+// up{mode!=""}.
+func carrying(sel selector, name string) selector {
+	ms := append(slices.Clip(sel.matchers), labels.MustNewMatcher(labels.MatchNotEqual, name, ""))
+	vs := &parser.VectorSelector{LabelMatchers: ms}
+	for _, m := range ms {
+		if m.Name == model.MetricNameLabel && m.Type == labels.MatchEqual {
+			vs.Name = m.Value
+		}
+	}
+	return selector{text: vs.String(), matchers: ms}
 }
 
 // listing resolves a listing's range and parses its selectors.

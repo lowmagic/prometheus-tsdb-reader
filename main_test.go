@@ -124,6 +124,11 @@ func TestBadArguments(t *testing.T) {
 		{"positional expression", []string{"--dump", ".", "query", "instant", "up"}},
 		{"bad time", []string{"--dump", ".", "query", "instant", "--promql", "up", "--time", "yesterday"}},
 		{"unknown command", []string{"--dump", ".", "query", "nonsense"}},
+		// --promql has one spelling, so a caller that denies that argument denies free-form PromQL.
+		{"single-dash promql", []string{"--dump", ".", "query", "instant", "-promql", "up"}},
+		{"promql with =", []string{"--dump", ".", "query", "instant", "--promql=up"}},
+		{"single-dash promql with =", []string{"--dump", ".", "query", "instant", "-promql=up"}},
+		{"series with =", []string{"--dump", ".", "query", "series", "--promql", "up", "--promql=up"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -311,6 +316,14 @@ func TestRefusedArchives(t *testing.T) {
 		},
 		{name: "hard link out", entries: []entry{link(tar.TypeLink, "wal", "../escaped")}, entry: "wal"},
 		{
+			// d/s leads to x inside the extraction, but the same target text from wal/ leads outside it.
+			name: "hard link to a symlink",
+			entries: []entry{
+				link(tar.TypeSymlink, "d/s", "../x"), link(tar.TypeLink, "wal/00000002", "d/s"),
+			},
+			entry: "wal/00000002",
+		},
+		{
 			name:    "device",
 			entries: []entry{{tar.Header{Name: "dev", Typeflag: tar.TypeChar, Mode: 0o600, Devmajor: 1, Devminor: 3}, ""}},
 			entry:   "dev",
@@ -362,6 +375,40 @@ func TestRefusedArchives(t *testing.T) {
 				t.Errorf("run(%q) left %v under scratch, want nothing", args, names)
 			}
 		})
+	}
+}
+
+// A dangling link that leads out of the extraction through another link would reach a file created beside the
+// extraction later, so it is removed.
+func TestDanglingLinkIsRemoved(t *testing.T) {
+	parent := t.TempDir()
+	archive := writeArchive(t, parent, "dump.tar.gz", func(w io.Writer) (err error) {
+		gz := gzip.NewWriter(w)
+		tw := tar.NewWriter(gz)
+		for _, hdr := range []tar.Header{
+			{Name: "b", Typeflag: tar.TypeSymlink, Linkname: ".", Mode: 0o777},
+			{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "b/../later", Mode: 0o777},
+			{Name: "wal/", Typeflag: tar.TypeDir, Mode: 0o755},
+		} {
+			if err := tw.WriteHeader(&hdr); err != nil {
+				return err
+			}
+		}
+		return errors.Join(tw.Close(), gz.Close())
+	})
+	scratch := mkdir(t, parent, "scratch")
+
+	var stdout, stderr bytes.Buffer
+	args := []string{"--dump", archive, "--scratch", scratch, "info"}
+	err := run(t.Context(), args, &stdout, &stderr)
+	if refused := (*dump.RefusedError)(nil); errors.As(err, &refused) {
+		t.Fatalf("run(%q) = %v, want the archive extracted", args, err)
+	}
+	if _, err := os.Lstat(filepath.Join(scratch, "dump", "a")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("run(%q) kept the dangling link a: Lstat = %v, want it gone", args, err)
+	}
+	if _, err := os.Lstat(filepath.Join(scratch, "dump", "b")); err != nil {
+		t.Errorf("run(%q) removed the link b, which resolves: %v", args, err)
 	}
 }
 
@@ -503,6 +550,21 @@ func TestEmptyReasons(t *testing.T) {
 		{"comparison", []string{"query", "range", "--promql", "up > 5"}, "empty-evaluation", []any{}},
 		{"instant after the dump", []string{"query", "instant", "--promql", "up", "--time", dayAfter}, "outside-dump-range", []any{}},
 		{"series of a missing metric", []string{"query", "series", "--promql", "node_load1"}, "no-matching-series", []any{"node_load1"}},
+		{
+			"stopped series in a subquery", []string{"query", "instant", "--promql", `max_over_time(up{instance="node-c"}[10m:1m])`},
+			"no-samples-in-range", []any{`up{instance="node-c"}`},
+		},
+		{
+			"offset side", []string{"query", "range", "--promql", "up - up offset 1d"},
+			"no-samples-in-range", []any{"up offset 1d"},
+		},
+		{"offset", []string{"query", "instant", "--promql", "up offset 1d"}, "no-samples-in-range", []any{"up offset 1d"}},
+		{"departed target", []string{"query", "instant", "--promql", fixture.Departed}, "no-samples-in-range", []any{fixture.Departed}},
+		{"missing label", []string{"query", "labels", "nonexistent"}, "no-matching-series", []any{`{nonexistent!=""}`}},
+		{
+			"label the selector lacks", []string{"query", "labels", "mode", "--promql", "up"},
+			"no-matching-series", []any{`up{mode!=""}`},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -512,8 +574,10 @@ func TestEmptyReasons(t *testing.T) {
 			if diff := cmp.Diff(want, records[0]["empty"]); diff != "" {
 				t.Errorf("run(%q): empty (-want +got):\n%s", args, diff)
 			}
-			if len(records) != 1 {
-				t.Errorf("run(%q): %d records after the summary, want none", args, len(records)-1)
+			for _, r := range records[1:] {
+				if r["kind"] != "labels" { // A label listing writes its record, empty, either way.
+					t.Errorf("run(%q): record %v after the summary, want none", args, r)
+				}
 			}
 		})
 	}
@@ -585,5 +649,117 @@ func TestSampleIntervalVaries(t *testing.T) {
 				t.Errorf("run(%q): sample-interval-varies warned %v, want %v; warnings %v", args, warned, tt.want, warnings)
 			}
 		})
+	}
+}
+
+func TestSampleInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval time.Duration
+		args     []string
+		want     string
+	}{
+		{"subquery", 15 * time.Second, []string{"query", "instant", "--promql", "max_over_time(up[10m:1m])"}, "15s"},
+		// An instant query reads 5m of samples, so 2m samples are further apart than a quarter of the window.
+		{"sparse instant", 2 * time.Minute, []string{"query", "instant", "--promql", "up"}, "2m"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--dump", writeFixture(t, tt.interval), "--scratch", t.TempDir()}, tt.args...)
+			summary := mustRun(t, args...)[0]
+			if summary["sample_interval"] != tt.want || summary["empty"] != nil {
+				t.Errorf("run(%q): sample_interval %v, empty %v; want %s and null", args,
+					summary["sample_interval"], summary["empty"], tt.want)
+			}
+		})
+	}
+}
+
+// An out-of-order block doesn't hold the in-order samples in its range, so the replay keeps them from the WAL,
+// as Prometheus's own open does.
+func TestOutOfOrderBlock(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	blocks, err := fixture.Blocks(dumpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Without chunks_head/ the WAL is the head's only source, so the samples after the in-order block come from
+	// it alone; a replay skips WAL samples older than a chunk it loaded from chunks_head/.
+	for _, dir := range []string{blocks[1], filepath.Join(dumpDir, "chunks_head")} {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fixture.OutOfOrder(dumpDir, fixture.Start().Add(2*time.Hour), fixture.Start().Add(4*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, at := range []time.Duration{3 * time.Hour, 4 * time.Hour, 5 * time.Hour} {
+		args := []string{"--dump", dumpDir, "--scratch", t.TempDir(), "query", "instant",
+			"--promql", `count_over_time(up{instance="node-a"}[1h])`, "--time", fixture.Start().Add(at).Format(time.RFC3339)}
+		records := mustRun(t, args...)
+		if len(records) != 2 {
+			t.Fatalf("run(%q) = %v, want one series", args, records)
+		}
+		if value, _ := records[1]["value"].([]any); len(value) != 2 || value[1] != "240" {
+			t.Errorf("run(%q): value %v, want 240 samples in the hour", args, records[1]["value"])
+		}
+	}
+}
+
+// With the first block gone, the WAL still holds its samples, but a replay drops them, so the dump starts at
+// the remaining block.
+func TestWALBeforeBlocks(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	blocks, err := fixture.Blocks(dumpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(blocks[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	wantStart := fixture.Start().Add(2 * time.Hour).Format(time.RFC3339)
+	for _, command := range [][]string{{"info"}, {"query", "instant", "--promql", "up"}} {
+		args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir()}, command...)
+		dumpRec, _ := mustRun(t, args...)[0]["dump"].(map[string]any)
+		if dumpRec["start"] != wantStart {
+			t.Errorf("run(%q): dump.start = %v, want %s", args, dumpRec["start"], wantStart)
+		}
+	}
+	args := []string{"--dump", dumpDir, "--scratch", t.TempDir(), "query", "instant", "--promql", "up",
+		"--time", fixture.Start().Add(time.Hour).Format(time.RFC3339)}
+	empty, _ := mustRun(t, args...)[0]["empty"].(map[string]any)
+	if empty["reason"] != "outside-dump-range" {
+		t.Errorf("run(%q): empty = %v, want outside-dump-range", args, empty)
+	}
+}
+
+// failingWriter accepts limit bytes and fails every write after.
+type failingWriter struct {
+	limit int
+	bytes.Buffer
+}
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	if w.Len()+len(p) > w.limit {
+		return 0, errors.New("disk full")
+	}
+	return w.Buffer.Write(p)
+}
+
+// A run whose stdout fails partway has written part of its result, and an error record after it would join a
+// cut line, so none is written.
+func TestFailedWriteAddsNoRecord(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	stdout := &failingWriter{limit: 8 << 10}
+	var stderr bytes.Buffer
+	args := []string{"--dump", dumpDir, "--scratch", t.TempDir(), "query", "range", "--promql", "up", "--step", "15s"}
+	if err := run(t.Context(), args, stdout, &stderr); err == nil {
+		t.Fatalf("run(%q) with stdout failing = nil, want an error", args)
+	}
+	if stdout.Len() == 0 || bytes.Contains(stdout.Bytes(), []byte(`"kind":"error"`)) {
+		t.Errorf("run(%q) wrote %d bytes, with an error record: %t; want part of the result and no error record",
+			args, stdout.Len(), bytes.Contains(stdout.Bytes(), []byte(`"kind":"error"`)))
 	}
 }

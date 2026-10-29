@@ -105,31 +105,39 @@ relative to the dump, never to now, because a dump is old and a range ending now
   since it may hold another archive's extraction. An extraction fills a hidden directory beside it and is moved
   into place only when complete, so the named directory never holds a partial one.
 - **DUMP-2: Safe extraction.** Extraction refuses an entry whose path would land outside the extraction
-  directory, a symbolic or hard link whose target would, and a device or other special file. It counts the
-  bytes it writes and stops at `--max-extract-bytes`; a partial extraction answers wrong, so the run then fails
-  with exit code 1 and says how far it got. An archive the tool refuses is reported with the entry that caused
-  it.
+  directory, a symbolic or hard link whose target would, a hard link to a symbolic link (a second name for the
+  link in another directory, where its target text leads elsewhere), and a device or other special file. A
+  symbolic link that resolves to nothing is removed once extraction ends and named on stderr: it reaches nothing
+  in the archive, and once the extraction moves under scratch its target could lead to a file created there
+  later. It counts the bytes it writes and stops at `--max-extract-bytes`; a partial extraction answers wrong, so
+  the run then fails with exit code 1 and says how far it got. An archive the tool refuses is reported with the
+  entry that caused it.
 - **DUMP-3: Find the TSDB root.** Dumps differ in layout: the blocks sit at the top level, under `data/`, under
   `prometheus/`, or deeper. The tool finds the one directory that holds block directories (named by ULID, each
   with a `meta.json`) or a `wal/` directory, and says which it chose. When it finds none it fails and lists what
   it saw; when it finds more than one it fails and lists them, and `--root` picks one.
-- **DUMP-4: Never write under the dump.** Opening a TSDB for reading still writes: the head that replays the
-  WAL cuts, truncates and removes its chunk files, so Prometheus's own read-only opener links the dump's
+- **DUMP-4: Never write under the dump.** Opening a TSDB for reading still writes: the head that replays the WAL
+  cuts, truncates and removes its chunk files, so Prometheus's own read-only opener links the dump's
   `chunks_head/` files into a scratch directory, and a link can't leave a filesystem (see
   [stack.md](stack.md#adr-002-build-on-prometheuss-tsdb-and-promql-packages)). The tool instead copies
   `chunks_head/` into a directory it creates under `--scratch` for the run, by hard link when the dump and
-  scratch share a filesystem and by copying otherwise, replays the WAL there, and removes that directory on
-  exit. The dump is opened only for reading, so a dump on a read-only mount, a USB disk or a container volume
-  works. Scratch needs room for the extracted archive plus a copy of `chunks_head/`.
-- **DUMP-5: Say what the dump covers.** `info` reports the dump's start (the earliest block's start) and end
-  (the latest sample in the newest block or the WAL), each block's time range, series count and status, whether
-  the WAL exists, its size, its own newest sample and whether it was read, skipped or failed, the gaps, the
-  TSDB root it chose and the PromQL version. The WAL's newest sample comes from decoding its records in one
-  pass, not from replaying it, so `info` is cheap in memory on any dump; a query makes the same pass before it
-  replays, so its summary reports the same newest sample, at the cost of reading the WAL twice. The newest
-  block's last sample comes from its index, since a block's own end is the end of the range it was cut for. Every query's summary repeats the
-  dump's start and end, so a reader never has to guess why a range is empty. With `--no-wal`, the dump's end
-  for queries is the newest block's end, and the WAL's own range is still reported as the WAL's.
+  scratch share a filesystem and by copying otherwise, replays the WAL there, and removes that directory on exit,
+  including when an interrupt stops the run, even partway through the replay, and when the reader of stdout goes
+  away. A second interrupt stops the run at once and may leave the directory behind. The dump is opened only for
+  reading, so a dump on a read-only mount, a USB disk or a container volume works. Scratch needs room for the
+  extracted archive plus a copy of `chunks_head/`.
+- **DUMP-5: Say what the dump covers.** `info` reports the dump's start (the earliest block's start, or the WAL's
+  oldest sample a replay keeps when that is earlier) and end (the latest sample in the newest block or the WAL),
+  each block's time range, series count and status, whether the WAL exists, its size, its own newest sample and
+  whether it was read, skipped or failed, the gaps, the TSDB root it chose and the PromQL version. The WAL's
+  newest sample comes from decoding its records in one pass, not from replaying it, so `info` is cheap in memory
+  on any dump; a query makes the same pass before it replays, so its summary reports the same newest sample, at
+  the cost of reading the WAL twice. The newest block's last sample comes from its index, since a block's own end
+  is the end of the range it was cut for. A replay keeps the WAL's samples from the latest end of a block cut
+  from in-order samples, as Prometheus's own open does; a block cut from out-of-order samples, or from only some
+  series, doesn't move that bound, since the WAL still holds the in-order samples in its range. Every query's
+  summary repeats the dump's start and end, so a reader never has to guess why a range is empty. With `--no-wal`,
+  the dump's end for queries is the newest block's end, and the WAL's own range is still reported as the WAL's.
 
 ## Damage
 
@@ -166,10 +174,12 @@ from what is readable and says what it left out.
   decoding the WAL's series and metadata records, since the replayed head doesn't expose them. The result says
   when the dump has no metadata at all, which is a different answer from a metric having none.
 - **QUERY-6: Free-form PromQL sits behind one flag.** The only way an expression or selector string enters the
-  tool through argv is `--promql`. Named queries never take one. A caller that denies `--promql` can run only
-  named queries, `info`, `query labels` without a selector and `query metadata`. The other way PromQL reaches
-  the tool is a named-query file ([NAMED-12](#named-queries)); a caller that wants only the shipped queries
-  denies `--queries` too.
+  tool through argv is `--promql`, written as that argument followed by the expression as the next one. The other
+  spellings Go's flag package reads (`-promql X`, `--promql=X`, `-promql=X`) are bad arguments (exit 2), so a
+  caller that denies the argument `--promql` denies it in every spelling. Named queries never take one. A caller
+  that denies `--promql` can run only named queries, `info`, `query labels` without a selector and `query
+  metadata`. The other way PromQL reaches the tool is a named-query file ([NAMED-12](#named-queries)); a caller
+  that wants only the shipped queries denies `--queries` too.
 - **QUERY-7: Every result names its PromQL version.** The engine is the one Prometheus release the binary
   embeds (see [stack.md](stack.md#adr-003-one-embedded-promql-version)), which isn't necessarily the cluster's.
   Every summary carries `promql_version`: the Prometheus release the embedded module corresponds to, in the
@@ -303,19 +313,30 @@ same matchers on both sides; with different instances on each side the division 
   | `block` | `info` | `dir`, `start`, `end` (exclusive, as the block's `meta.json` gives them), `series`, `status` (`ok`, `corrupt` or `superseded`) and `error` |
 
 - **OUTPUT-4: Say why a result is empty.** An empty result's summary carries one `empty` reason and the
-  selectors it applies to. `outside-dump-range`: the range or time doesn't overlap the dump.
-  `no-matching-series`: a selector in the expression matches nothing in the dump at any time.
-  `no-samples-in-range`: every selector matches series, but one of them has no samples in the range.
-  `empty-evaluation`: every selector has samples in the range and the expression still produced nothing, as
-  when a comparison holds for no series or the two sides of a binary operation share no label set. The four
-  are different answers, and the first is the one the web UI gives silently. The tool learns the selector
-  facts from a pass over the expression's vector selectors after evaluation ([STEP-4](#steps)); for
-  `no-matching-series` it selects over the dump's whole range and stops at the first match. A selector is
-  named as written, without its offset or `@` modifier. The listings use the same reasons: an empty series
-  listing is `outside-dump-range`, `no-matching-series` or `no-samples-in-range`, and an empty label listing
-  without a selector is `outside-dump-range` or `no-samples-in-range`.
+  selectors it applies to. `outside-dump-range`: the query's time or range, before the lookback delta, range
+  selectors and offsets widen it, doesn't overlap the dump. `no-matching-series`: a selector in the expression
+  matches nothing in the dump at any time. `no-samples-in-range`: every selector matches series, but one of
+  them has no sample the result could show in the window the engine reads for that selector. A stale marker,
+  which Prometheus writes when a target disappears, isn't such a sample: an instant selector whose newest sample
+  in its lookback is a stale marker shows nothing, so a target that went away just before the query time reads
+  as `no-samples-in-range`. `empty-evaluation`: every selector has samples in the range and the expression still
+  produced nothing, as when a comparison holds for no series or the two sides of a binary operation share no
+  label set. The four are different answers, and the first is the one the web UI gives silently. The tool learns
+  the selector facts from a pass over the expression's vector selectors after evaluation ([STEP-4](#steps)),
+  each over its own window, so the side of `up - up offset 1d` that has no samples is the one named; for
+  `no-matching-series` it selects over the dump's whole range and stops at the first match. A query's selector
+  is named in the parser's printed form with its offset or `@` modifier, as `up offset 1d`. The listings use the
+  same reasons and name a selector as given: an empty series listing is `outside-dump-range`,
+  `no-matching-series` or `no-samples-in-range`, and so is an empty label listing. A label listing with a
+  `NAME` covers only the series carrying that label, so each selector, or with none every series, is narrowed
+  by `NAME!=""` and named in the parser's form: `query labels mode --promql up` on a dump whose `up` has no
+  `mode` label is `no-matching-series` naming `up{mode!=""}`. A listing of label names without a selector is
+  empty only where the dump has no samples, so it is `outside-dump-range` or `no-samples-in-range`.
 - **OUTPUT-5: A failed run says why on stdout.** A run that exits 1 or 3 writes one `error` record as its only
-  stdout line, with `exit`, `message`, and for exit 3 the `limit` and its `value`.
+  stdout line, with `exit`, `message`, and for exit 3 the `limit` and its `value`. The tool finishes its work,
+  closing the dump and removing its run directory, before it writes the result, so the one failure that can
+  follow part of a result is writing stdout itself; the lines already written then stand, and no `error` record
+  follows them, since it would join a cut line.
 
 An instant query's output looks like this, with the summary on one line:
 
@@ -375,16 +396,16 @@ nothing, since PromQL repeats the last sample at each extra point.
 - **STEP-3: Warn when the step is finer than the data.** When the step is shorter than the observed sample
   interval, the summary warns `step-finer-than-data`, saying the extra points repeat the same samples.
 - **STEP-4: Say what the samples can show.** Every query summary carries `sample_interval`, the median gap
-  between consecutive raw samples of the expression's vector selectors over the window the engine reads for
-  the query: the range, or the time for an instant query, widened by the lookback delta, range selectors and
-  offsets. A gap of a second or more is rounded to the second, so scrape jitter doesn't split one interval in
-  two. A reader learns the finest view the dump can give. The tool gets it from a pass over the selectors
-  after evaluation, which also serves OUTPUT-4. The pass doesn't read every sample again: for each series it
-  reads up to 8 gaps at each of 4 points spread evenly across the window, skipping the chunks between them
-  undecoded, so its cost grows with the number of series, not the length of the range. When the median gap
-  differs between those points, as when a scrape interval changed or scrapes stopped partway, the summary
-  warns `sample-interval-varies` with the median at each point, since one interval then misdescribes the
-  window.
+  between consecutive raw samples of the expression's vector selectors over the window the engine reads for the
+  query: the range, or the time for an instant query, widened by the lookback delta, range selectors and offsets.
+  A gap of a second or more is rounded to the second, so scrape jitter doesn't split one interval in two. A
+  reader learns the finest view the dump can give. The tool gets it from a pass over the selectors after
+  evaluation, which also serves OUTPUT-4. The pass doesn't read every sample again: for each series it reads up
+  to 8 gaps from each of 4 points spread evenly across the window, so samples further apart than a quarter of the
+  window still have their gap read. Reaching each point still decodes the chunks before it, so the pass costs
+  more over a longer range. When the median gap differs between those points, as when a scrape interval changed
+  or scrapes stopped partway, the summary warns `sample-interval-varies` with the median at each point, since one
+  interval then misdescribes the window.
 
 ## Fixtures
 

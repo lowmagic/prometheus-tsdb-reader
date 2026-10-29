@@ -30,7 +30,12 @@ const (
 )
 
 func main() {
+	// A reader that stops reading, as head does, makes a write to stdout fail rather than kill the run, so the
+	// run still removes its run directory.
+	signal.Ignore(syscall.SIGPIPE)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The first interrupt cancels the run, which then removes its run directory; a second one stops it at once.
+	context.AfterFunc(ctx, stop)
 	err := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()
 	if err != nil {
@@ -55,15 +60,30 @@ func usagef(format string, args ...any) error {
 }
 
 // run executes one command. Stdout gets only JSON lines: the result, or for a failed run one error record.
+// Every command finishes its work before it renders, so a run fails after writing part of its result only when
+// writing to stdout fails, and then no error record follows, as it would join a cut line.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	out := bufio.NewWriter(stdout)
+	written := &countingWriter{w: stdout}
+	out := bufio.NewWriter(written)
 	err := execute(ctx, args, out, stderr)
 	var usage *usageError
-	if err != nil && !errors.As(err, &usage) {
-		out.Reset(stdout)
+	if err != nil && !errors.As(err, &usage) && written.n == 0 {
+		out.Reset(written)
 		err = errors.Join(err, render.Error(out, exitFailed, err.Error()))
 	}
 	return errors.Join(err, out.Flush())
+}
+
+// countingWriter counts the bytes written through it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // defaultMaxExtractBytes is the spec's default for --max-extract-bytes: 32 GiB.
@@ -106,6 +126,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		"the TSDB root `directory`, relative to the dump's, when the dump holds more than one")
 	global.Int64Var(&cfg.dumpOpts.MaxExtractBytes, "max-extract-bytes", defaultMaxExtractBytes,
 		"the most `bytes` extracting an archive may write")
+	if err := checkSpelling(args); err != nil {
+		return err
+	}
 	if err := global.Parse(args); err != nil {
 		return flagError(err)
 	}
@@ -139,7 +162,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	return usagef("unknown command %q", rest)
 }
 
-func info(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) (err error) {
+func info(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("info", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
@@ -153,16 +176,18 @@ func info(ctx context.Context, cfg config, args []string, stdout, stderr io.Writ
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, o.st.Close()) }()
-
 	var blocks []render.Block
 	for _, b := range o.st.Blocks() {
 		blocks = append(blocks, render.Block{Dir: b.Dir, Start: b.Start, End: b.End, Series: b.Series, Status: b.Status})
 	}
-	return render.Info(stdout, o.summary("info"), blocks)
+	summary, err := o.close("info", nil)
+	if err != nil {
+		return err
+	}
+	return render.Info(stdout, summary, blocks)
 }
 
-func queryInstant(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) (err error) {
+func queryInstant(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("query instant", stderr)
 	expr := fs.String("promql", "", "the PromQL `expression` to evaluate")
 	at := timeFlag(fs, "time", "evaluation time (default the dump's end)")
@@ -177,15 +202,15 @@ func queryInstant(ctx context.Context, cfg config, args []string, stdout, stderr
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, o.st.Close()) }()
 	res, err := query.NewEngine().Instant(ctx, o.queryDump(), *expr, *at)
+	summary, err := o.close("query instant", err)
 	if err != nil {
 		return err
 	}
-	return render.Instant(stdout, o.summary("query instant"), *expr, res)
+	return render.Instant(stdout, summary, *expr, res)
 }
 
-func queryRange(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) (err error) {
+func queryRange(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("query range", stderr)
 	expr := fs.String("promql", "", "the PromQL `expression` to evaluate")
 	var span query.Span
@@ -211,15 +236,15 @@ func queryRange(ctx context.Context, cfg config, args []string, stdout, stderr i
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, o.st.Close()) }()
 	res, err := query.NewEngine().Range(ctx, o.queryDump(), *expr, span)
+	summary, err := o.close("query range", err)
 	if err != nil {
 		return err
 	}
-	return render.Range(stdout, o.summary("query range"), *expr, res)
+	return render.Range(stdout, summary, *expr, res)
 }
 
-func querySeries(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) (err error) {
+func querySeries(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("query series", stderr)
 	selectors := selectorsFlag(fs)
 	start := timeFlag(fs, "start", "range start (default the dump's start)")
@@ -235,15 +260,15 @@ func querySeries(ctx context.Context, cfg config, args []string, stdout, stderr 
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, o.st.Close()) }()
 	l, err := query.NewEngine().Series(ctx, o.queryDump(), *selectors, *start, *end)
+	summary, err := o.close("query series", err)
 	if err != nil {
 		return err
 	}
-	return render.Series(stdout, o.summary("query series"), l)
+	return render.Series(stdout, summary, l)
 }
 
-func queryLabels(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) (err error) {
+func queryLabels(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
 	// NAME comes before the flags, as in promtool, and the flag package stops at the first non-flag argument.
 	var name string
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -261,12 +286,37 @@ func queryLabels(ctx context.Context, cfg config, args []string, stdout, stderr 
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, o.st.Close()) }()
 	l, err := query.NewEngine().Labels(ctx, o.queryDump(), name, *selectors, *start, *end)
+	summary, err := o.close("query labels", err)
 	if err != nil {
 		return err
 	}
-	return render.Labels(stdout, o.summary("query labels"), l)
+	return render.Labels(stdout, summary, l)
+}
+
+// deniable reports whether a caller may deny a flag by refusing one argument, so it is accepted in only one
+// spelling.
+func deniable(name string) bool { return name == "promql" }
+
+// checkSpelling refuses a deniable flag written other than as --NAME followed by its value. The flag package
+// also reads -NAME VALUE, --NAME=VALUE and -NAME=VALUE, any of which would pass a caller that denies the
+// argument --NAME.
+func checkSpelling(args []string) error {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			return nil
+		}
+		name, _, _ := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if !strings.HasPrefix(a, "-") || !deniable(name) {
+			continue
+		}
+		if a != "--"+name {
+			return usagef("write %q as --%s followed by its value, as two arguments", a, name)
+		}
+		i++ // Its value, which may itself start with a dash.
+	}
+	return nil
 }
 
 func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
@@ -335,6 +385,13 @@ func (c config) open(ctx context.Context, replay bool) (_ *opened, err error) {
 
 func (o *opened) queryDump() query.Dump {
 	return query.Dump{Queryable: o.st, Start: o.start, End: o.end}
+}
+
+// close closes the store, so a failure to close, such as scratch filling as the head writes its chunks, is
+// reported before anything is rendered. It returns the command's summary, or err joined with the close's.
+func (o *opened) close(command string, err error) (render.Summary, error) {
+	summary := o.summary(command)
+	return summary, errors.Join(err, o.st.Close())
 }
 
 func (o *opened) summary(command string) render.Summary {

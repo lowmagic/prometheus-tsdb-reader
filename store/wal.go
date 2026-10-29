@@ -15,23 +15,34 @@ import (
 	"github.com/prometheus/prometheus/tsdb/wlog"
 )
 
-// walSpan is the oldest and newest sample times a WAL holds, when sampled.
+// walSpan is the newest sample time a WAL holds, when sampled, and the oldest a replay keeps, when kept.
 type walSpan struct {
-	oldest, newest int64
-	sampled        bool
+	minValid   int64
+	newest     int64
+	sampled    bool
+	oldestKept int64
+	kept       bool
 }
 
 func (s *walSpan) add(t int64) {
 	if !s.sampled {
-		s.oldest, s.newest, s.sampled = t, t, true
+		s.newest, s.sampled = t, true
+	}
+	s.newest = max(s.newest, t)
+	if t < s.minValid {
 		return
 	}
-	s.oldest, s.newest = min(s.oldest, t), max(s.newest, t)
+	if !s.kept {
+		s.oldestKept, s.kept = t, true
+	}
+	s.oldestKept = min(s.oldestKept, t)
 }
 
 // readWAL decodes every record in the WAL's last checkpoint and the segments after it, the ones a replay reads,
-// and returns the span of their samples. It builds no head, so it holds one record at a time in memory.
-func readWAL(dir string, logger *slog.Logger) (span walSpan, err error) {
+// and returns the span of their samples, counting as kept those a replay from minValid keeps. It builds no
+// head, so it holds one record at a time in memory.
+func readWAL(ctx context.Context, dir string, minValid int64, logger *slog.Logger) (span walSpan, err error) {
+	span.minValid = minValid
 	ranges := []wlog.SegmentRange{{Dir: dir, First: -1, Last: -1}}
 	checkpoint, idx, err := wlog.LastCheckpoint(dir)
 	switch {
@@ -54,6 +65,9 @@ func readWAL(dir string, logger *slog.Logger) (span walSpan, err error) {
 	)
 	r := wlog.NewReader(rc)
 	for r.Next() {
+		if err := ctx.Err(); err != nil {
+			return walSpan{}, err
+		}
 		rec := r.Record()
 		switch dec.Type(rec) {
 		case record.Samples, record.SamplesV2:
@@ -98,6 +112,9 @@ func lastSample(ctx context.Context, b *tsdb.Block) (_ int64, _ bool, err error)
 	)
 	maxt := int64(math.MinInt64)
 	for p.Next() {
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
+		}
 		if err := ir.Series(p.At(), &builder, &chks); err != nil {
 			return 0, false, err
 		}

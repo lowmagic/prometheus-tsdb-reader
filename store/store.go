@@ -104,20 +104,23 @@ func Open(ctx context.Context, d dump.Dump, opts Options, logger *slog.Logger) (
 		return nil, fmt.Errorf("size WAL: %w", err)
 	}
 	logger.Info("reading WAL", "bytes", s.wal.Bytes)
-	span, err := readWAL(d.WAL, tsdbLogger)
+	minValid := s.minValid()
+	span, err := readWAL(ctx, d.WAL, minValid, tsdbLogger)
 	if err != nil {
 		return nil, fmt.Errorf("read WAL: %w", err)
 	}
 	s.wal.State = WALRead
 	if span.sampled {
 		s.wal.Newest, s.wal.Sampled = timestamp.Time(span.newest).UTC(), true
-		s.mint, s.maxt = min(s.mint, span.oldest), max(s.maxt, span.newest)
+	}
+	if span.kept {
+		s.mint, s.maxt = min(s.mint, span.oldestKept), max(s.maxt, span.newest)
 	}
 
 	if !opts.Replay {
 		return s, nil
 	}
-	if err := s.replay(ctx, d, opts.Scratch, tsdbLogger, logger); err != nil {
+	if err := s.replay(ctx, d, opts.Scratch, minValid, tsdbLogger, logger); err != nil {
 		return nil, err
 	}
 	s.wal.State = WALReplayed
@@ -154,8 +157,22 @@ func (s *Store) openBlocks(ctx context.Context, dirs []string, tsdbLogger *slog.
 	return nil
 }
 
-// replay builds the head from the WAL in a run directory under scratch.
-func (s *Store) replay(ctx context.Context, d dump.Dump, scratch string, tsdbLogger, logger *slog.Logger) error {
+// minValid is the time before which a replay drops the WAL's samples, as Prometheus's own open sets it: the
+// latest end of a block cut from in-order samples. Blocks cut from out-of-order samples, or from only some of
+// the head's series, don't count, since the WAL still holds in-order samples in their range.
+func (s *Store) minValid() int64 {
+	t := int64(math.MinInt64)
+	for _, b := range s.blocks {
+		c := b.Meta().Compaction
+		if !c.FromOutOfOrder() && !c.FromStaleSeries() && !c.FromSelectedSeries() {
+			t = max(t, b.Meta().MaxTime)
+		}
+	}
+	return t
+}
+
+// replay builds the head from the WAL in a run directory under scratch, keeping samples from minValid on.
+func (s *Store) replay(ctx context.Context, d dump.Dump, scratch string, minValid int64, tsdbLogger, logger *slog.Logger) error {
 	if err := checkOutside(scratch, d.Path); err != nil {
 		return err
 	}
@@ -181,18 +198,24 @@ func (s *Store) replay(ctx context.Context, d dump.Dump, scratch string, tsdbLog
 	if err != nil {
 		return fmt.Errorf("open WAL: %w", err)
 	}
-	s.head, err = tsdb.NewHead(nil, tsdbLogger, w, nil, opts, tsdb.NewHeadStats())
+	head, err := tsdb.NewHead(nil, tsdbLogger, w, nil, opts, tsdb.NewHeadStats())
 	if err != nil {
 		return fmt.Errorf("create head: %w", err)
 	}
-	// Samples the blocks already hold are left out of the head, as Prometheus does.
-	minValid := int64(math.MinInt64)
-	for _, b := range s.blocks {
-		minValid = max(minValid, b.Meta().MaxTime)
-	}
 	logger.Info("replaying WAL", "bytes", s.wal.Bytes)
-	if err := s.head.Init(minValid); err != nil {
-		return fmt.Errorf("replay WAL: %w", err)
+	// Head.Init takes no context, so it runs on its own and an interrupt stops waiting for it. The head is then
+	// left unclosed, since closing it would race the replay, and Close removes the run directory under it, which
+	// fails the replay's next chunk write. A caller that stops a replay this way is expected to exit.
+	replayed := make(chan error, 1)
+	go func() { replayed <- head.Init(minValid) }()
+	select {
+	case err := <-replayed:
+		s.head = head
+		if err != nil {
+			return fmt.Errorf("replay WAL: %w", err)
+		}
+	case <-ctx.Done():
+		return fmt.Errorf("replay WAL: %w", ctx.Err())
 	}
 	logger.Info("replayed WAL", "series", s.head.NumSeries())
 	return nil

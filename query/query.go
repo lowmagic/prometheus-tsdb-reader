@@ -201,6 +201,15 @@ func (e *Engine) Range(ctx context.Context, d Dump, expr string, span Span) (*Re
 // result is empty, the reason.
 func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Result, error) {
 	defer qry.Close()
+	// The engine rewrites the statement as it evaluates, as when it replaces a subquery with the series it
+	// computed, so the selectors and their windows are read before it runs.
+	stmt, ok := qry.Statement().(*parser.EvalStmt)
+	if !ok {
+		return nil, fmt.Errorf("unexpected statement %T", qry.Statement())
+	}
+	sels := selectorsOf(stmt)
+	start, end := stmt.Start.UnixMilli(), stmt.End.UnixMilli()
+
 	res := qry.Exec(ctx)
 	if res.Err != nil {
 		return nil, fmt.Errorf("evaluate %q: %w", expr, res.Err)
@@ -216,13 +225,7 @@ func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Resul
 		out.Warnings = append(out.Warnings, Warning{Code: "promql", Message: a})
 	}
 
-	stmt, ok := qry.Statement().(*parser.EvalStmt)
-	if !ok {
-		return nil, fmt.Errorf("unexpected statement %T", qry.Statement())
-	}
-	sels := selectorsOf(stmt.Expr)
-	mint, maxt := promql.FindMinMaxTime(stmt)
-	sc, err := scan(ctx, d.Queryable, sels, mint, maxt)
+	sc, err := scan(ctx, d.Queryable, sels)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +234,10 @@ func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Resul
 		out.Warnings = append([]Warning{w}, out.Warnings...)
 	}
 	if out.isEmpty() {
-		if out.Empty, err = explain(ctx, d, sels, mint, maxt, sc.withoutSamples); err != nil {
+		out.Empty, err = explain(ctx, d, sels, start, end, func() ([]selector, error) {
+			return unsampled(ctx, d.Queryable, sels)
+		})
+		if err != nil {
 			return nil, err
 		}
 	}
