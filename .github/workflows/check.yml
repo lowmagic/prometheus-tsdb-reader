@@ -1,0 +1,20 @@
+name: check
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15
+          install-only: true
+      - run: make check
+  standards:
+    uses: junglestyle/.github/.github/workflows/standards-check.yml@main
