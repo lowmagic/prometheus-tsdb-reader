@@ -14,16 +14,18 @@ with typed flags.
 - **Answers PromQL from a dump.** Instant and range queries, series, labels and metadata, with the CLI
   modeled on `promtool query` and the output on the Prometheus HTTP API's response shape, as JSON lines with
   RFC 3339 times.
-- **Never writes under the dump.** Prometheus's reader writes scratch files even when read-only; the tool
-  puts them under `--scratch` (default: the working directory), so a read-only mount works.
-- **Opens what Prometheus won't.** A corrupt block is skipped and reported as a gap. The WAL can be skipped,
-  and a WAL that fails to replay is reported as the newest samples missing, not deleted by hand.
-- **Says why a result is empty.** A range outside the dump, a selector nothing matches, and a series with no
-  samples in the range are three different answers, and every result states the dump's start and end.
+- **Never writes under the dump.** Replaying the WAL needs a writable copy of the head's chunk files, and the
+  tool makes it under `--scratch`, so a dump on a read-only mount works.
+- **Answers from damaged dumps.** A corrupt block is skipped and reported as a gap. The WAL can be skipped,
+  and a WAL that fails partway is replayed as far as it goes and the rest reported as the newest samples
+  missing, not discarded.
+- **Says why a result is empty.** A range outside the dump, a selector nothing matches, a series with no
+  samples in the range and an expression that evaluates to nothing are four different answers, and every
+  result states the dump's start and end.
 - **Bounds everything.** Series and point limits with a truncation record when one is hit, a sample limit for
-  the engine, and defaults that keep a result under 1 MiB.
-- **Warns about steps.** Samples are about a minute apart, so a step coarser than that hides peaks and a
-  finer one adds nothing. The summary says which.
+  the engine, and defaults that keep a result under the sandboxed caller's cap.
+- **Warns about steps.** A step coarser than the samples hides peaks and a finer one adds nothing. The
+  summary says which, and what the samples can show.
 - **Named queries from typed flags.** Pod CPU and memory against limits, node CPU, iowait, load, memory,
   network and disk latency, the node-exporter recording rules, and KubeVirt VM filesystems, each built from
   flags such as `--namespace`, `--pod` and `--window` with proper escaping. They come from a file the binary
@@ -50,9 +52,10 @@ prometheus-tsdb-reader --dump ./dump.tar.gz --scratch /tmp/work query range \
 ```
 
 Each command prints a summary line first, then one JSON record per series; progress goes to stderr. Times
-default to the dump's end, not to now. The [specification](docs/SPEC.md) lists every command, flag, default,
-warning and empty reason; the [roadmap](docs/ROADMAP.md) gives the order they get built in; and
-[stack and decisions](docs/stack.md) records why it's Go on Prometheus's own packages. The packages under
+default to the dump's end, not to now. An archive is extracted once under `--scratch`, and pointing `--dump`
+at that directory skips the extraction on later runs. The [specification](docs/SPEC.md) lists every command,
+flag, default, warning and empty reason; the [roadmap](docs/ROADMAP.md) gives the order they get built in;
+and [stack and decisions](docs/stack.md) records why it's Go on Prometheus's own packages. The packages under
 the CLI are a public Go API.
 
 `make check` runs the checks CI runs, offline. `make standards` checks the org standards copies and needs the

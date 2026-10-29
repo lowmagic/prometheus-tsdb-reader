@@ -13,14 +13,18 @@ prometheus-tsdb-reader --dump ./dump --scratch /tmp/work query instant --promql 
 ```
 
 They get a summary line and one series record per series on stdout, progress on stderr, and the dump is
-untouched. The binary they ran is a static build.
+untouched. The binary they ran is a static build. The store opens the blocks and builds the head from the
+WAL itself, the way [ADR-002](stack.md#adr-002-build-on-prometheuss-tsdb-and-promql-packages) describes, so
+nothing in this slice is replaced later.
 
-Delivers: RUN-1, RUN-3, DUMP-4, QUERY-1, QUERY-6, QUERY-7, OUTPUT-1, OUTPUT-2, OUTPUT-3, plus the first
-synthetic [fixture](SPEC.md#fixtures) and the `make check` that builds with `CGO_ENABLED=0`.
+Delivers: RUN-1, RUN-3's exit codes 0 and 1, RUN-4, DUMP-4, QUERY-1, QUERY-6, QUERY-7, OUTPUT-1, OUTPUT-2,
+OUTPUT-3, OUTPUT-5, plus the first synthetic [fixture](SPEC.md#fixtures) and the `make check` that builds with
+`CGO_ENABLED=0`.
 
 Done when: against the synthetic fixture, the command above prints a summary that names the expression, the
-time and the PromQL version, then the series, and the dump directory's modification times and contents are
-unchanged afterwards. The same binary, copied to a host with no Go toolchain, runs.
+time and the PromQL version in release form, then the series; the dump directory's modification times and
+contents are unchanged afterwards and the run's scratch directory is gone; `ldd` reports the binary isn't
+dynamic; and the fixture has a `chunks_head/` file, so the copy was exercised.
 
 ## 2. Any dump: archives, layouts and what the dump covers
 
@@ -31,14 +35,16 @@ A user can hand the tool a `.tar.gz` as captured, or a directory with the blocks
 prometheus-tsdb-reader --dump ./dump.tar.gz info
 ```
 
-They see the dump's start and end, its blocks and its WAL. An archive that tries to write outside the scratch
-directory is refused with the entry named.
+They see the dump's start and end, its blocks and its WAL, with the WAL's newest sample found without a replay.
+An archive that tries to write outside the scratch directory is refused with the entry named, and stderr says
+where the extraction landed so the next run can start from it.
 
-Delivers: DUMP-1, DUMP-2, DUMP-3, DUMP-5, RUN-2's write boundary.
+Delivers: DUMP-1, DUMP-2, DUMP-3 with `--root`, DUMP-5, RUN-2's write boundary.
 
 Done when: `info` on a fixture archive in each layout reports the same range; a crafted archive with a `..`
-entry, a link out and an oversize entry is refused with the reason; and a run with a read-only dump and a
-writable scratch succeeds.
+entry, a link out and an oversize entry is refused with the reason and exit code 1; `--root` resolves a
+fixture with two candidate roots; and, demonstrated by hand, a dump on a read-only mount with `--scratch` on
+another filesystem answers.
 
 ## 3. Range queries, series and labels, with time defaults and empty reasons
 
@@ -53,35 +59,42 @@ prometheus-tsdb-reader --dump ./dump query labels instance
 
 Delivers: QUERY-2, QUERY-3, QUERY-4, QUERY-8, OUTPUT-4, STEP-1, STEP-2, STEP-3, STEP-4.
 
-Done when: on a fixture with 1m samples, a range query with no flags ends at the dump's end with a 1m step; a
+Done when: on a fixture with 1m samples, a range query with no flags ends at the dump's end with a 1m step and
+no step warning, and `--step 15m` warns `step-coarse` while `--step 10s` warns `step-finer-than-data`; on a
+fixture with 15s samples the default step warns `step-coarse` and the summary's `sample_interval` is 15s; a
 query ending a day after the dump reports `outside-dump-range`; a query for a metric the fixture lacks reports
-`no-matching-series`; a query for a series that stops before the range reports `no-samples-in-range`; and
-`--step 15m` warns `step-coarse` while `--step 10s` warns `step-finer-than-data`.
+`no-matching-series` naming the selector; a query for a series that stops before the range reports
+`no-samples-in-range`; and `up > 5` reports `empty-evaluation`.
 
 ## 4. Damaged dumps
 
-A user with a dump Prometheus refuses to start on gets answers from the readable parts and a record of the
-rest: a corrupt block becomes a gap in the summary, `--no-wal` skips a WAL too big for the host, and a WAL that
-fails to replay is reported as the newest samples missing.
+A user with a dump Prometheus won't start on, or would repair by discarding part of the WAL, gets answers from
+the readable parts and a record of the rest: a corrupt block becomes a gap in the summary, `--no-wal` skips a
+WAL too big for the host, and a WAL that fails partway is replayed up to the failure and reported as the newest
+samples missing.
 
 Delivers: DAMAGE-1, DAMAGE-2, DAMAGE-3.
 
 Done when: on the fixture with a corrupt block, a range query over it answers with that block's range in
-`gaps`; on the fixture with an unreadable WAL, the query answers from the blocks and the summary names the
-missing span and the error; and `--no-wal` on a healthy fixture moves the dump's end back to the newest block
-and says so.
+`gaps`; on the fixture with a block that a compacted block supersedes, the block is listed and the summary has
+no gap; on the fixture whose WAL is unreadable partway, the query returns the samples written before the
+damage, and the summary's `wal.missing` starts at the newest sample kept, ends at the newest readable
+timestamp after the damage, and names the error; and `--no-wal` on a healthy fixture moves the dump's end
+back to the newest block and says so.
 
 ## 5. Bounds
 
 A user who asks for too much gets a result that fits, with a record of what was cut, and a user on a small
-host sees the WAL's size before replay starts. The defaults keep a full result under 1 MiB, which is what the
-sandboxed caller keeps.
+host sees the WAL's size before replay starts. The defaults keep a full result under the sandboxed caller's
+cap.
 
-Delivers: LIMIT-1, LIMIT-2, LIMIT-3, LIMIT-4, and the rest of RUN-2.
+Delivers: LIMIT-1, LIMIT-2, LIMIT-3, LIMIT-4, RUN-3's exit code 3, and the rest of RUN-2. The spec sets no
+memory flag, so this slice has nothing to demonstrate for memory beyond the WAL's size on stderr.
 
-Done when: a range query over more series than `--max-series` returns that many whole series and a `truncated`
-record with the full count; the same for points; a query over `--max-samples` fails with exit code 1 and the
-engine's error; a run of every command with the default limits on a fixture wider than the limits writes under
+Done when: a range query over more series than `--max-series` returns that many whole series, the first in
+label order, and a `truncated` record with the full count; the same for points; an instant query over the
+limit is cut in label order on every run; a query over `--max-samples` exits 3 with an `error` record naming
+the limit; a run of every command with the default limits on a fixture wider than the limits writes under
 1 MiB; and the WAL's size appears on stderr before replay.
 
 ## 6. Named queries for pods and nodes
@@ -89,7 +102,7 @@ engine's error; a run of every command with the default limits on a fixture wide
 A user, or the sandboxed caller, gets the pod and node views from typed flags with no PromQL in argv:
 
 ```sh
-prometheus-tsdb-reader --dump ./dump named pod-cpu --namespace openshift-monitoring --pod 'prometheus-k8s-.*'
+prometheus-tsdb-reader --dump ./dump named pod-cpu --namespace shop --pod 'checkout-.*'
 prometheus-tsdb-reader --dump ./dump named node-cpu --window 5m --start 6h
 ```
 
@@ -98,11 +111,13 @@ missing. The queries come from a file the binary embeds, and `--queries` points 
 
 Delivers: NAMED-1 through NAMED-9 and NAMED-12.
 
-Done when: each named query runs against a fixture carrying its metrics and the summary's expression is the
-one the spec's table gives; a `--namespace` value with a quote and a backslash in it produces a correctly
-escaped matcher; a fixture pod with no limit series appears in the summary's list; `node-disk-write-latency`
-with `--instance` set returns a result on a fixture where both sides exist; and a copy of the shipped file with
-one query added runs that query through `--queries`.
+Done when: each named query runs against a fixture carrying its metrics, and the summary's expression parses to
+the same syntax tree as the spec's table entry with the flag matchers added (the printer sorts matchers and
+normalizes spacing, so the comparison is of parsed forms, not text); a `--namespace` value with a quote and a
+backslash in it matches a fixture series carrying that namespace; a fixture pod with no limit series appears
+in the summary's `unpaired`; `node-disk-write-latency` with `--instance` set returns a result on a fixture
+where both sides exist; and a copy of the shipped file with one query added runs that query through
+`--queries`.
 
 ## 7. Recording rules, VM filesystems and metadata
 
@@ -112,15 +127,17 @@ metadata the dump carries, if any.
 Delivers: NAMED-10, NAMED-11, QUERY-5.
 
 Done when: `named node-rules` and `named vm-filesystem` run against fixtures carrying those series with the
-expressions the spec gives; `query metadata` on a fixture without metadata says the dump carries none; and on a
-fixture whose WAL holds metadata records, it lists them.
+expressions the spec gives, under the same parsed-form comparison as slice 6; `query metadata` on a fixture
+without metadata says the dump carries none; and on a fixture written with metadata WAL records on, it lists
+them.
 
 ## 8. Checked against a real dump
 
 An engineer runs the named queries against a real dump, outside the repo, and the expressions' metric and
-label names are confirmed or corrected. This slice resolves the spec's [unknowns](SPEC.md#unknowns) about
-metric names and dump layouts and tunes the limit defaults from real WAL sizes; nothing from the dump enters
-the repo.
+label names are confirmed or corrected. This slice resolves what the [fixtures](SPEC.md#fixtures) section says
+synthetic fixtures can't prove and tunes the limit defaults from real WAL sizes; nothing from the dump enters
+the repo, so nobody can demonstrate this slice from the repo alone. Its record is the commit that changes the
+spec and the code, or that says nothing needed changing.
 
 Delivers: the parts of the [fixtures](SPEC.md#fixtures) section that synthetic fixtures can't.
 

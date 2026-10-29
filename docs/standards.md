@@ -22,10 +22,10 @@ is public API, so an exported identifier is interface and changing it is an inte
 | Layer | Owns | Mustn't know |
 | --- | --- | --- |
 | `dump` | Accepting a path or archive, extracting safely under scratch, finding the TSDB root, listing blocks and the WAL | PromQL, the output format, flags |
-| `store` | Opening the TSDB read-only with the scratch root, skipping corrupt blocks, replaying or skipping the WAL, the dump's range and gaps | archives and layouts, PromQL text, the output format |
-| `query` | Running an expression through the engine, time defaults, step defaults and warnings, limits and truncation, empty reasons | files, archives, flags, JSON |
-| `named` | Reading the query file, adding typed values to an expression's syntax tree as matchers | storage, output, flags |
-| `render` | Writing the summary and records as JSON lines | where a result came from, the engine |
+| `store` | Opening blocks one at a time, copying `chunks_head/` under scratch and building the head from the WAL there, decoding the WAL for its newest timestamp and metadata, the dump's range, gaps and missing span, one queryable per run | archives and layouts, PromQL text, the output format |
+| `query` | Running an expression through the engine, the selector pass behind the empty reasons and the sample interval, time and step defaults and warnings, limits and truncation; it returns the tool's own result types, not the engine's | files, archives, flags, JSON |
+| `named` | Reading the query file, adding typed values to an expression's syntax tree as matchers, pairing expressions for `compare` | storage, output, flags |
+| `render` | Writing the summary, records and the error record as JSON lines from `query`'s result types | where a result came from, the `promql` and `tsdb` packages |
 | CLI (`main`) | Flags, wiring the layers, exit codes, stderr progress | the internals of any of them |
 
 - One code path evaluates a query, whether it came from `--promql` or a named query: `named` produces an
@@ -37,20 +37,22 @@ is public API, so an exported identifier is interface and changing it is an inte
 
 ## Errors and recovery
 
-- A damaged block or WAL is a reported gap ([Damage](SPEC.md#damage)), never a swallowed error and never a
-  fatal one. The one place that catches a `tsdb` open error decides between the two and records which.
+- A damaged block is a reported gap and a WAL that fails partway is a reported missing span
+  ([Damage](SPEC.md#damage)), never a swallowed error and never a fatal one. The one place that catches a `tsdb`
+  open error decides which and records it.
 - A limit that cuts a result produces a truncation record. Cutting without the record is a bug.
 
 ## Testing
 
 - The behaviors worth a test: safe extraction (traversal, links out, size), finding the TSDB root in each
-  layout, never writing under the dump, a corrupt block becoming a gap, `--no-wal` and a failed WAL being
-  reported, the three empty reasons, each limit and its truncation record, the step warnings, matcher escaping,
-  the PromQL version in the summary, the output's shape, and that the shipped query file loads.
+  layout, never writing under the dump and the `chunks_head/` copy, a corrupt block becoming a gap, `--no-wal`,
+  a failed WAL keeping what replayed before the failure and reporting the span, the four empty reasons, each
+  limit with its truncation record or its exit code, the step warnings, matcher escaping, the PromQL version in
+  the summary, the output's shape, and that the shipped query file loads.
 - The JSON lines output is interface: another program reads it, so a test may pin its shape. Warning and
   progress text is checked by meaning (the warning's code), not its wording.
-- Fixtures are synthetic, built with the `tsdb` package in a test helper, never checked in as binary blobs
-  from a real dump. The [spec](SPEC.md#fixtures) says what they don't prove.
+- Fixtures are what the spec's [Fixtures](SPEC.md#fixtures) section describes, built in a test helper, never
+  checked in as binary blobs.
 
 ## Privacy
 
