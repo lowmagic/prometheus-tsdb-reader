@@ -39,6 +39,15 @@ type walPass struct {
 	// newestAfter is the newest sample in a readable record after the failure, when after.
 	newestAfter int64
 	after       bool
+
+	// Decoding buffers, reused from record to record, so the pass allocates only when a record outgrows them.
+	series     []record.RefSeries
+	samples    []record.RefSample
+	histograms []record.RefHistogramSample
+	floatHists []record.RefFloatHistogramSample
+	tombstones []tombstones.Stone
+	exemplars  []record.RefExemplar
+	metadata   []record.RefMetadata
 }
 
 func (p *walPass) add(t int64) {
@@ -201,31 +210,28 @@ func (p *walPass) decode(dec *record.Decoder, rec []byte) error {
 	var err error
 	switch dec.Type(rec) {
 	case record.Series:
-		_, err = dec.Series(rec, nil)
+		p.series, err = dec.Series(rec, p.series[:0])
 	case record.Samples, record.SamplesV2:
-		var samples []record.RefSample
-		samples, err = dec.Samples(rec, nil)
-		for _, s := range samples {
+		p.samples, err = dec.Samples(rec, p.samples[:0])
+		for _, s := range p.samples {
 			p.add(s.T)
 		}
 	case record.HistogramSamples, record.CustomBucketsHistogramSamples, record.HistogramSamplesV2:
-		var histograms []record.RefHistogramSample
-		histograms, err = dec.HistogramSamples(rec, nil)
-		for _, h := range histograms {
+		p.histograms, err = dec.HistogramSamples(rec, p.histograms[:0])
+		for _, h := range p.histograms {
 			p.add(h.T)
 		}
 	case record.FloatHistogramSamples, record.CustomBucketsFloatHistogramSamples, record.FloatHistogramSamplesV2:
-		var histograms []record.RefFloatHistogramSample
-		histograms, err = dec.FloatHistogramSamples(rec, nil)
-		for _, h := range histograms {
+		p.floatHists, err = dec.FloatHistogramSamples(rec, p.floatHists[:0])
+		for _, h := range p.floatHists {
 			p.add(h.T)
 		}
 	case record.Tombstones:
-		_, err = dec.Tombstones(rec, []tombstones.Stone(nil))
+		p.tombstones, err = dec.Tombstones(rec, p.tombstones[:0])
 	case record.Exemplars:
-		_, err = dec.Exemplars(rec, nil)
+		p.exemplars, err = dec.Exemplars(rec, p.exemplars[:0])
 	case record.Metadata:
-		_, err = dec.Metadata(rec, nil)
+		p.metadata, err = dec.Metadata(rec, p.metadata[:0])
 	}
 	if err != nil {
 		return fmt.Errorf("decode %s: %w", dec.Type(rec), err)
