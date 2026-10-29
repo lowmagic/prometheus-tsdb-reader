@@ -41,6 +41,8 @@ is public API, so an exported identifier is interface and changing it is an inte
   ([Damage](SPEC.md#damage)), never a swallowed error and never a fatal one. The one place that catches a `tsdb`
   open error decides which and records it.
 - A limit that cuts a result produces a truncation record. Cutting without the record is a bug.
+- `main` exits with [RUN-3](SPEC.md#running-it)'s code for the error `run` returns, not always 1 as the org's
+  Go standard has it. It's still the only place that calls `os.Exit`.
 
 ## Testing
 
