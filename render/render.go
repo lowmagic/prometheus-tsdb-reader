@@ -11,14 +11,12 @@ import (
 	"github.com/junglestyle/prometheus-tsdb-reader/query"
 )
 
-// Summary is what qualifies a result: what ran, over what dump, with which engine.
+// Summary is what qualifies every result: what ran, over what dump, with which engine.
 type Summary struct {
 	Command       string
 	PromQLVersion string
 	Dump          Dump
 	WAL           WAL
-	Expression    string
-	Time          time.Time
 }
 
 // Dump is the dump's range and the TSDB root the run used.
@@ -27,16 +25,55 @@ type Dump struct {
 	Root       string
 }
 
-// WAL is what the run did with the WAL.
+// WAL is what the run did with the WAL, its size, and its newest sample when Sampled.
 type WAL struct {
-	State string
-	Bytes int64
+	State   string
+	Bytes   int64
+	Newest  time.Time
+	Sampled bool
+}
+
+// Block is one block as info lists it. End is exclusive.
+type Block struct {
+	Dir        string
+	Start, End time.Time
+	Series     uint64
+	Status     string
+}
+
+// Info writes info's summary, then one record per block.
+func Info(w io.Writer, s Summary, blocks []Block) error {
+	enc := newEncoder(w)
+	if err := enc.Encode(headOf(s)); err != nil {
+		return err
+	}
+	for _, b := range blocks {
+		rec := blockRecord{
+			Kind: "block", Dir: b.Dir, Start: timeOf(b.Start), End: timeOf(b.End), Series: b.Series, Status: b.Status,
+		}
+		if err := enc.Encode(rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Instant writes an instant query's summary, then its records.
-func Instant(w io.Writer, s Summary, r *query.Result) error {
+func Instant(w io.Writer, s Summary, expr string, at time.Time, r *query.Result) error {
 	enc := newEncoder(w)
-	if err := enc.Encode(summaryOf(s, r)); err != nil {
+	warnings := make([]warning, 0, len(r.Annotations))
+	for _, a := range r.Annotations {
+		warnings = append(warnings, warning{Code: "promql", Message: a})
+	}
+	summary := instantSummary{
+		summaryHead: headOf(s),
+		Expression:  expr,
+		Time:        timeOf(at),
+		Series:      len(r.Series),
+		Points:      r.Points(),
+		Warnings:    warnings,
+	}
+	if err := enc.Encode(summary); err != nil {
 		return err
 	}
 	switch r.Type {
@@ -74,17 +111,22 @@ func newEncoder(w io.Writer) *json.Encoder {
 	return enc
 }
 
-type summaryRecord struct {
-	Kind          string    `json:"kind"`
-	Command       string    `json:"command"`
-	PromQLVersion string    `json:"promql_version"`
-	Dump          dumpRec   `json:"dump"`
-	WAL           walRec    `json:"wal"`
-	Expression    string    `json:"expression"`
-	Time          timeOf    `json:"time"`
-	Series        int       `json:"series"`
-	Points        int       `json:"points"`
-	Warnings      []warning `json:"warnings"`
+// summaryHead is the summary fields every command writes. Embedded, its fields come first in the record.
+type summaryHead struct {
+	Kind          string  `json:"kind"`
+	Command       string  `json:"command"`
+	PromQLVersion string  `json:"promql_version"`
+	Dump          dumpRec `json:"dump"`
+	WAL           walRec  `json:"wal"`
+}
+
+type instantSummary struct {
+	summaryHead
+	Expression string    `json:"expression"`
+	Time       timeOf    `json:"time"`
+	Series     int       `json:"series"`
+	Points     int       `json:"points"`
+	Warnings   []warning `json:"warnings"`
 }
 
 type dumpRec struct {
@@ -94,8 +136,20 @@ type dumpRec struct {
 }
 
 type walRec struct {
-	State string `json:"state"`
-	Bytes int64  `json:"bytes"`
+	State  string  `json:"state"`
+	Bytes  int64   `json:"bytes"`
+	Newest *timeOf `json:"newest"`
+}
+
+type blockRecord struct {
+	Kind   string `json:"kind"`
+	Dir    string `json:"dir"`
+	Start  timeOf `json:"start"`
+	End    timeOf `json:"end"`
+	Series uint64 `json:"series"`
+	Status string `json:"status"`
+	// Error is the reason a block didn't open; null for one that did.
+	Error *string `json:"error"`
 }
 
 type warning struct {
@@ -121,22 +175,18 @@ type errorRecord struct {
 	Message string `json:"message"`
 }
 
-func summaryOf(s Summary, r *query.Result) summaryRecord {
-	warnings := make([]warning, 0, len(r.Annotations))
-	for _, a := range r.Annotations {
-		warnings = append(warnings, warning{Code: "promql", Message: a})
+func headOf(s Summary) summaryHead {
+	wal := walRec{State: s.WAL.State, Bytes: s.WAL.Bytes}
+	if s.WAL.Sampled {
+		newest := timeOf(s.WAL.Newest)
+		wal.Newest = &newest
 	}
-	return summaryRecord{
+	return summaryHead{
 		Kind:          "summary",
 		Command:       s.Command,
 		PromQLVersion: s.PromQLVersion,
 		Dump:          dumpRec{Start: timeOf(s.Dump.Start), End: timeOf(s.Dump.End), Root: s.Dump.Root},
-		WAL:           walRec(s.WAL),
-		Expression:    s.Expression,
-		Time:          timeOf(s.Time),
-		Series:        len(r.Series),
-		Points:        r.Points(),
-		Warnings:      warnings,
+		WAL:           wal,
 	}
 }
 

@@ -26,35 +26,59 @@ import (
 
 // WAL states, as the summary reports them.
 const (
+	// WALReplayed is a WAL replayed into the head, so queries see its samples.
 	WALReplayed = "replayed"
-	WALAbsent   = "absent"
+	// WALRead is a WAL decoded for its range without building a head.
+	WALRead = "read"
+	// WALAbsent is a dump with no WAL.
+	WALAbsent = "absent"
 )
 
 // WAL is what the store did with the dump's write-ahead log.
 type WAL struct {
 	State string
 	Bytes int64
+	// Newest is the WAL's newest sample, when Sampled.
+	Newest  time.Time
+	Sampled bool
+}
+
+// BlockOK is the status of a block that opened.
+const BlockOK = "ok"
+
+// Block is one block's directory, range and size.
+type Block struct {
+	Dir string
+	// Start and End are the block's range as its meta.json gives it; End is exclusive.
+	Start, End time.Time
+	Series     uint64
+	Status     string
+}
+
+// Options says whether to build a head, and where its files go.
+type Options struct {
+	// Scratch is the directory the run directory goes under.
+	Scratch string
+	// Replay builds the head from the WAL, so queries see its samples. Without it the store only reports what
+	// the dump covers, and writes nothing.
+	Replay bool
 }
 
 // Store is a dump's blocks and head, read without writing under the dump. It is a storage.Queryable.
 type Store struct {
 	blocks []*tsdb.Block
+	// head is nil unless the WAL was replayed.
 	head   *tsdb.Head
 	runDir string
 	wal    WAL
+	// mint and maxt are the first and last sample times in the blocks and the WAL.
+	mint, maxt int64
 }
 
-// Open opens the blocks in d and replays its WAL into a head whose chunk files live in a run directory it
-// creates under scratch. Close removes that directory.
-func Open(ctx context.Context, d dump.Dump, scratch string, logger *slog.Logger) (_ *Store, err error) {
-	if err := checkOutside(scratch, d.Path); err != nil {
-		return nil, err
-	}
-	runDir, err := os.MkdirTemp(scratch, "prometheus-tsdb-reader-run-")
-	if err != nil {
-		return nil, fmt.Errorf("create run directory under %s: %w", scratch, err)
-	}
-	s := &Store{runDir: runDir, wal: WAL{State: WALAbsent}}
+// Open opens the blocks in d and decodes its WAL for its range. With opts.Replay it also replays the WAL into a
+// head whose chunk files live in a run directory under opts.Scratch, which Close removes.
+func Open(ctx context.Context, d dump.Dump, opts Options, logger *slog.Logger) (_ *Store, err error) {
+	s := &Store{wal: WAL{State: WALAbsent}, mint: math.MaxInt64, maxt: math.MinInt64}
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, s.Close())
@@ -64,60 +88,114 @@ func Open(ctx context.Context, d dump.Dump, scratch string, logger *slog.Logger)
 	// The tsdb package logs at info level for routine work; its warnings are worth passing on.
 	tsdbLogger := slog.New(levelHandler{slog.LevelWarn, logger.Handler()})
 
-	for _, dir := range d.Blocks {
+	if err := s.openBlocks(ctx, d.Blocks, tsdbLogger); err != nil {
+		return nil, err
+	}
+	logger.Info("opened blocks", "count", len(s.blocks))
+	if d.WBL != "" {
+		logger.Warn("not reading wbl/: out-of-order samples in the dump are left out")
+	}
+	if d.WAL == "" {
+		return s, nil
+	}
+
+	s.wal.Bytes, err = dirBytes(d.WAL)
+	if err != nil {
+		return nil, fmt.Errorf("size WAL: %w", err)
+	}
+	logger.Info("reading WAL", "bytes", s.wal.Bytes)
+	span, err := readWAL(d.WAL, tsdbLogger)
+	if err != nil {
+		return nil, fmt.Errorf("read WAL: %w", err)
+	}
+	s.wal.State = WALRead
+	if span.sampled {
+		s.wal.Newest, s.wal.Sampled = timestamp.Time(span.newest).UTC(), true
+		s.mint, s.maxt = min(s.mint, span.oldest), max(s.maxt, span.newest)
+	}
+
+	if !opts.Replay {
+		return s, nil
+	}
+	if err := s.replay(ctx, d, opts.Scratch, tsdbLogger, logger); err != nil {
+		return nil, err
+	}
+	s.wal.State = WALReplayed
+	return s, nil
+}
+
+func (s *Store) openBlocks(ctx context.Context, dirs []string, tsdbLogger *slog.Logger) error {
+	for _, dir := range dirs {
 		b, err := tsdb.OpenBlock(tsdbLogger, dir, chunkenc.NewPool(), tsdb.DefaultPostingsDecoderFactory)
 		if err != nil {
-			return nil, fmt.Errorf("open block %s: %w", filepath.Base(dir), err)
+			return fmt.Errorf("open block %s: %w", filepath.Base(dir), err)
 		}
 		s.blocks = append(s.blocks, b)
 	}
+	if len(s.blocks) == 0 {
+		return nil
+	}
 	sort.Slice(s.blocks, func(i, j int) bool { return s.blocks[i].Meta().MinTime < s.blocks[j].Meta().MinTime })
-	logger.Info("opened blocks", "count", len(s.blocks))
 
-	if d.WBL != "" {
-		logger.Warn("not reading wbl/: out-of-order samples in the dump are left out")
+	newest := s.blocks[0]
+	for _, b := range s.blocks {
+		s.mint = min(s.mint, b.Meta().MinTime)
+		if b.Meta().MaxTime > newest.Meta().MaxTime {
+			newest = b
+		}
+	}
+	last, ok, err := lastSample(ctx, newest)
+	if err != nil {
+		return fmt.Errorf("find the last sample in block %s: %w", newest.Meta().ULID, err)
+	}
+	if ok {
+		s.maxt = max(s.maxt, last)
+	}
+	return nil
+}
+
+// replay builds the head from the WAL in a run directory under scratch.
+func (s *Store) replay(ctx context.Context, d dump.Dump, scratch string, tsdbLogger, logger *slog.Logger) error {
+	if err := checkOutside(scratch, d.Path); err != nil {
+		return err
+	}
+	var err error
+	s.runDir, err = os.MkdirTemp(scratch, "prometheus-tsdb-reader-run-")
+	if err != nil {
+		return fmt.Errorf("create run directory under %s: %w", scratch, err)
 	}
 
 	// The head cuts, truncates and removes chunk files as it replays, so it gets its own copy of them.
 	if d.ChunksHead != "" {
-		method, err := copyDir(ctx, d.ChunksHead, filepath.Join(runDir, "chunks_head"))
+		method, err := copyDir(ctx, d.ChunksHead, filepath.Join(s.runDir, "chunks_head"))
 		if err != nil {
-			return nil, fmt.Errorf("copy chunks_head: %w", err)
+			return fmt.Errorf("copy chunks_head: %w", err)
 		}
-		logger.Info("copied chunks_head under scratch", "by", method, "dir", runDir)
+		logger.Info("copied chunks_head under scratch", "by", method, "dir", s.runDir)
 	}
 
 	opts := tsdb.DefaultHeadOptions()
-	opts.ChunkDirRoot = runDir
-	var w *wlog.WL
-	if d.WAL != "" {
-		s.wal.Bytes, err = dirBytes(d.WAL)
-		if err != nil {
-			return nil, fmt.Errorf("size WAL: %w", err)
-		}
-		// wlog.Open only records the directory; the head reads segments from it and writes nothing there.
-		w, err = wlog.Open(tsdbLogger, d.WAL)
-		if err != nil {
-			return nil, fmt.Errorf("open WAL: %w", err)
-		}
-		logger.Info("replaying WAL", "bytes", s.wal.Bytes)
+	opts.ChunkDirRoot = s.runDir
+	// wlog.Open only records the directory; the head reads segments from it and writes nothing there.
+	w, err := wlog.Open(tsdbLogger, d.WAL)
+	if err != nil {
+		return fmt.Errorf("open WAL: %w", err)
 	}
 	s.head, err = tsdb.NewHead(nil, tsdbLogger, w, nil, opts, tsdb.NewHeadStats())
 	if err != nil {
-		return nil, fmt.Errorf("create head: %w", err)
+		return fmt.Errorf("create head: %w", err)
 	}
+	// Samples the blocks already hold are left out of the head, as Prometheus does.
 	minValid := int64(math.MinInt64)
-	if len(s.blocks) > 0 {
-		minValid = s.blocks[len(s.blocks)-1].Meta().MaxTime
+	for _, b := range s.blocks {
+		minValid = max(minValid, b.Meta().MaxTime)
 	}
+	logger.Info("replaying WAL", "bytes", s.wal.Bytes)
 	if err := s.head.Init(minValid); err != nil {
-		return nil, fmt.Errorf("replay WAL: %w", err)
+		return fmt.Errorf("replay WAL: %w", err)
 	}
-	if w != nil {
-		s.wal.State = WALReplayed
-		logger.Info("replayed WAL", "series", s.head.NumSeries())
-	}
-	return s, nil
+	logger.Info("replayed WAL", "series", s.head.NumSeries())
+	return nil
 }
 
 // Querier returns a querier over every block overlapping [mint, maxt] and the head.
@@ -140,7 +218,7 @@ func (s *Store) Querier(mint, maxt int64) (_ storage.Querier, err error) {
 		}
 		queriers = append(queriers, q)
 	}
-	if maxt >= s.head.MinTime() {
+	if s.head != nil && maxt >= s.head.MinTime() {
 		q, err := tsdb.NewBlockQuerier(tsdb.NewRangeHead(s.head, mint, maxt), mint, maxt)
 		if err != nil {
 			return nil, fmt.Errorf("query head: %w", err)
@@ -152,23 +230,30 @@ func (s *Store) Querier(mint, maxt int64) (_ storage.Querier, err error) {
 
 // Range returns the dump's first and last sample times, and false when it holds no samples.
 func (s *Store) Range() (start, end time.Time, ok bool) {
-	mint, maxt := int64(math.MaxInt64), int64(math.MinInt64)
-	if len(s.blocks) > 0 {
-		mint = s.blocks[0].Meta().MinTime
-		// A block's MaxTime is exclusive.
-		maxt = s.blocks[len(s.blocks)-1].Meta().MaxTime - 1
-	}
-	// An empty head's MinTime and MaxTime are MaxInt64 and MinInt64, so they change nothing here.
-	mint = min(mint, s.head.MinTime())
-	maxt = max(maxt, s.head.MaxTime())
-	if mint > maxt {
+	if s.mint > s.maxt {
 		return time.Time{}, time.Time{}, false
 	}
-	return timestamp.Time(mint), timestamp.Time(maxt), true
+	return timestamp.Time(s.mint).UTC(), timestamp.Time(s.maxt).UTC(), true
 }
 
-// WAL says whether the WAL was replayed and how big it is.
+// WAL says what was done with the WAL, how big it is and its newest sample.
 func (s *Store) WAL() WAL { return s.wal }
+
+// Blocks returns the blocks in start order.
+func (s *Store) Blocks() []Block {
+	out := make([]Block, 0, len(s.blocks))
+	for _, b := range s.blocks {
+		m := b.Meta()
+		out = append(out, Block{
+			Dir:    filepath.Base(b.Dir()),
+			Start:  timestamp.Time(m.MinTime).UTC(),
+			End:    timestamp.Time(m.MaxTime).UTC(),
+			Series: m.Stats.NumSeries,
+			Status: BlockOK,
+		})
+	}
+	return out
+}
 
 // Close closes the blocks and the head and removes the run directory.
 func (s *Store) Close() error {
@@ -179,7 +264,9 @@ func (s *Store) Close() error {
 	if s.head != nil {
 		errs = append(errs, s.head.Close())
 	}
-	errs = append(errs, os.RemoveAll(s.runDir))
+	if s.runDir != "" {
+		errs = append(errs, os.RemoveAll(s.runDir))
+	}
 	return errors.Join(errs...)
 }
 

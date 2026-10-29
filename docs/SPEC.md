@@ -98,9 +98,12 @@ relative to the dump, never to now, because a dump is old and a range ending now
 
 - **DUMP-1: A directory or an archive.** `--dump` names an extracted directory or an archive: a tar stream,
   gzip-compressed or not, recognized by its content rather than its name. An archive is extracted under
-  `--scratch` into a directory named for the archive, and stderr names that directory so the next run can pass
-  it as `--dump` and skip the extraction. The extraction stays; only the run's own directory ([DUMP-4](#dumps))
-  is removed on exit.
+  `--scratch` into a directory named for the archive, its name without `.tar.gz`, `.tgz`, `.tar` or `.gz`
+  (`dump.tar.gz` becomes `dump`), and stderr names that directory so the next run can pass it as `--dump` and
+  skip the extraction. The extraction stays; only the run's own directory ([DUMP-4](#dumps)) is removed on exit.
+  When that directory already exists, the run fails and names it rather than extracting over it or reusing it,
+  since it may hold another archive's extraction. An extraction fills a hidden directory beside it and is moved
+  into place only when complete, so the named directory never holds a partial one.
 - **DUMP-2: Safe extraction.** Extraction refuses an entry whose path would land outside the extraction
   directory, a symbolic or hard link whose target would, and a device or other special file. It counts the
   bytes it writes and stops at `--max-extract-bytes`; a partial extraction answers wrong, so the run then fails
@@ -120,9 +123,11 @@ relative to the dump, never to now, because a dump is old and a range ending now
   works. Scratch needs room for the extracted archive plus a copy of `chunks_head/`.
 - **DUMP-5: Say what the dump covers.** `info` reports the dump's start (the earliest block's start) and end
   (the latest sample in the newest block or the WAL), each block's time range, series count and status, whether
-  the WAL exists, its size, its own newest sample and whether it was replayed, skipped or failed, the gaps, the
+  the WAL exists, its size, its own newest sample and whether it was read, skipped or failed, the gaps, the
   TSDB root it chose and the PromQL version. The WAL's newest sample comes from decoding its records in one
-  pass, not from replaying it, so `info` is cheap in memory on any dump. Every query's summary repeats the
+  pass, not from replaying it, so `info` is cheap in memory on any dump; a query makes the same pass before it
+  replays, so its summary reports the same newest sample, at the cost of reading the WAL twice. The newest
+  block's last sample comes from its index, since a block's own end is the end of the range it was cut for. Every query's summary repeats the
   dump's start and end, so a reader never has to guess why a range is empty. With `--no-wal`, the dump's end
   for queries is the newest block's end, and the WAL's own range is still reported as the WAL's.
 
@@ -275,7 +280,7 @@ same matchers on both sides; with different instances on each side the division 
   | `command` | `info`, `query instant`, `query range`, `query series`, `query labels`, `query metadata` or `named NAME` |
   | `promql_version` | [QUERY-7](#queries) |
   | `dump` | `start`, `end` and `root` ([DUMP-5](#dumps)) |
-  | `wal` | `state` (`replayed`, `skipped`, `failed` or `absent`), `bytes`, `newest`, and on failure `error` and `missing` with `start` and `end` (null when open-ended) ([DAMAGE-3](#damage)) |
+  | `wal` | `state` (`replayed`, `read` for `info`, which decodes the WAL without replaying it, `skipped`, `failed` or `absent`), `bytes`, `newest` (null when the WAL holds no samples), and on failure `error` and `missing` with `start` and `end` (null when open-ended) ([DAMAGE-3](#damage)) |
   | `gaps` | one entry per corrupt block overlapping the range, with `block`, `start`, `end` and `error` ([DAMAGE-1](#damage)); every block for `info` |
   | `expression` or `expressions` | the expression as evaluated, or for `named` an array of `name` and `promql` |
   | `time`, or `start`, `end` and `step` | the evaluation time or range, and the step that was used |
@@ -294,7 +299,7 @@ same matchers on both sides; with different instances on each side the division 
   | `scalar`, `string` | a query whose result isn't a vector | `value` as one `[time, "value"]` pair |
   | `labels` | `query labels` | `names`, or with a `NAME` the `name` and its `values` |
   | `metadata` | `query metadata` | `metric`, `type`, `help` and `unit` |
-  | `block` | `info` | `dir`, `start`, `end`, `series`, `status` (`ok`, `corrupt` or `superseded`) and `error` |
+  | `block` | `info` | `dir`, `start`, `end` (exclusive, as the block's `meta.json` gives them), `series`, `status` (`ok`, `corrupt` or `superseded`) and `error` |
 
 - **OUTPUT-4: Say why a result is empty.** An empty result's summary carries one `empty` reason and the
   selectors it applies to. `outside-dump-range`: the range or time doesn't overlap the dump.

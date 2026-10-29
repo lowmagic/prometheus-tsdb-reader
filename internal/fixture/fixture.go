@@ -3,9 +3,15 @@
 package fixture
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -57,4 +63,49 @@ func Write(ctx context.Context, dir string) (err error) {
 		return fmt.Errorf("compact fixture: %w", err)
 	}
 	return nil
+}
+
+// Archive writes the directory dir to w as a tar stream with every entry under prefix, gzip-compressed when
+// compress is set, as a dump arrives.
+func Archive(w io.Writer, dir, prefix string, compress bool) (err error) {
+	if compress {
+		gz := gzip.NewWriter(w)
+		defer func() { err = errors.Join(err, gz.Close()) }()
+		w = gz
+	}
+	tw := tar.NewWriter(w)
+	defer func() { err = errors.Join(err, tw.Close()) }()
+	return filepath.WalkDir(dir, func(path string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil || (rel == "." && prefix == "") {
+			return err
+		}
+		info, err := e.Info()
+		if err != nil {
+			return err
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(filepath.Join(prefix, rel))
+		if e.IsDir() {
+			hdr.Name += "/"
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if !e.Type().IsRegular() {
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		_, err = tw.Write(content)
+		return err
+	})
 }

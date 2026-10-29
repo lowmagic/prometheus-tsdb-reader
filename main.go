@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/junglestyle/prometheus-tsdb-reader/dump"
 	"github.com/junglestyle/prometheus-tsdb-reader/query"
@@ -62,32 +63,85 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return errors.Join(err, out.Flush())
 }
 
+// defaultMaxExtractBytes is the spec's default for --max-extract-bytes: 32 GiB.
+const defaultMaxExtractBytes = 32 << 30
+
+const usage = `usage: prometheus-tsdb-reader --dump PATH [global flags] COMMAND [command flags]
+
+commands:
+  info                                    what the dump covers: its range, blocks and WAL
+  query instant --promql EXPR [--time T]  one expression at one time
+
+global flags:`
+
+// config is what the global flags say about where the dump is and where the run may write.
+type config struct {
+	dump     string
+	dumpOpts dump.Options
+	logger   *slog.Logger
+}
+
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	global := flag.NewFlagSet("prometheus-tsdb-reader", flag.ContinueOnError)
 	global.SetOutput(stderr)
-	dumpPath := global.String("dump", "", "the extracted dump `directory`")
-	scratch := global.String("scratch", ".", "the only `directory` the tool writes under")
 	global.Usage = func() {
-		fmt.Fprintln(stderr, "usage: prometheus-tsdb-reader --dump DIR [--scratch DIR] query instant --promql EXPR [--time T]")
+		fmt.Fprintln(stderr, usage)
 		global.PrintDefaults()
 	}
+	var cfg config
+	global.StringVar(&cfg.dump, "dump", "", "the dump: an extracted `directory` or a tar archive, gzip-compressed or not")
+	global.StringVar(&cfg.dumpOpts.Scratch, "scratch", ".", "the only `directory` the tool writes under")
+	global.StringVar(&cfg.dumpOpts.Root, "root", "",
+		"the TSDB root `directory`, relative to the dump's, when the dump holds more than one")
+	global.Int64Var(&cfg.dumpOpts.MaxExtractBytes, "max-extract-bytes", defaultMaxExtractBytes,
+		"the most `bytes` extracting an archive may write")
 	if err := global.Parse(args); err != nil {
 		return flagError(err)
 	}
-	if *dumpPath == "" {
+	if cfg.dump == "" {
 		global.Usage()
 		return usagef("--dump is required")
 	}
+	if cfg.dumpOpts.MaxExtractBytes <= 0 {
+		return usagef("--max-extract-bytes must be positive, not %d", cfg.dumpOpts.MaxExtractBytes)
+	}
+	cfg.logger = slog.New(slog.NewTextHandler(stderr, nil))
 
 	rest := global.Args()
-	if len(rest) >= 2 && rest[0] == "query" && rest[1] == "instant" {
-		return queryInstant(ctx, *dumpPath, *scratch, rest[2:], stdout, stderr)
+	switch {
+	case len(rest) >= 1 && rest[0] == "info":
+		return info(ctx, cfg, rest[1:], stdout, stderr)
+	case len(rest) >= 2 && rest[0] == "query" && rest[1] == "instant":
+		return queryInstant(ctx, cfg, rest[2:], stdout, stderr)
 	}
 	global.Usage()
 	return usagef("unknown command %q", rest)
 }
 
-func queryInstant(ctx context.Context, dumpPath, scratch string, args []string, stdout, stderr io.Writer) (err error) {
+func info(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) (err error) {
+	fs := flag.NewFlagSet("info", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return flagError(err)
+	}
+	if fs.NArg() > 0 {
+		return usagef("unexpected argument %q: info takes none", fs.Arg(0))
+	}
+
+	o, err := cfg.open(ctx, false)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, o.st.Close()) }()
+
+	var blocks []render.Block
+	for _, b := range o.st.Blocks() {
+		blocks = append(blocks, render.Block{Dir: b.Dir, Start: b.Start, End: b.End, Series: b.Series, Status: b.Status})
+	}
+	return render.Info(stdout, o.summary("info"), blocks)
+}
+
+func queryInstant(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) (err error) {
 	fs := flag.NewFlagSet("query instant", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	expr := fs.String("promql", "", "the PromQL `expression` to evaluate")
@@ -107,42 +161,56 @@ func queryInstant(ctx context.Context, dumpPath, scratch string, args []string, 
 		return usagef("--promql is required")
 	}
 
-	logger := slog.New(slog.NewTextHandler(stderr, nil))
-	d, err := dump.Open(dumpPath)
+	o, err := cfg.open(ctx, true)
 	if err != nil {
 		return err
 	}
-	logger.Info("found TSDB", "root", d.Root, "blocks", len(d.Blocks), "wal", d.WAL != "")
+	defer func() { err = errors.Join(err, o.st.Close()) }()
 
-	st, err := store.Open(ctx, d, scratch, logger)
+	t := at.At(o.end)
+	res, err := query.NewEngine().Instant(ctx, o.st, *expr, t)
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, st.Close()) }()
+	return render.Instant(stdout, o.summary("query instant"), *expr, t, res)
+}
 
+// opened is a dump opened for one command, with its range.
+type opened struct {
+	d          dump.Dump
+	st         *store.Store
+	start, end time.Time
+}
+
+// open finds and opens the dump, replaying its WAL when a query needs the head.
+func (c config) open(ctx context.Context, replay bool) (_ *opened, err error) {
+	d, err := dump.Open(ctx, c.dump, c.dumpOpts, c.logger)
+	if err != nil {
+		return nil, err
+	}
+	st, err := store.Open(ctx, d, store.Options{Scratch: c.dumpOpts.Scratch, Replay: replay}, c.logger)
+	if err != nil {
+		return nil, err
+	}
 	start, end, ok := st.Range()
 	if !ok {
-		return fmt.Errorf("the dump at %s holds no samples", dumpPath)
+		return nil, errors.Join(fmt.Errorf("the dump at %s holds no samples", c.dump), st.Close())
 	}
-	t := at.At(end)
-	res, err := query.NewEngine().Instant(ctx, st, *expr, t)
-	if err != nil {
-		return err
-	}
+	return &opened{d: d, st: st, start: start, end: end}, nil
+}
 
+func (o *opened) summary(command string) render.Summary {
 	version, ok := query.PromQLVersion()
 	if !ok {
 		version = "unknown"
 	}
-	wal := st.WAL()
-	return render.Instant(stdout, render.Summary{
-		Command:       "query instant",
+	wal := o.st.WAL()
+	return render.Summary{
+		Command:       command,
 		PromQLVersion: version,
-		Dump:          render.Dump{Start: start, End: end, Root: d.RootName},
-		WAL:           render.WAL{State: wal.State, Bytes: wal.Bytes},
-		Expression:    *expr,
-		Time:          t,
-	}, res)
+		Dump:          render.Dump{Start: o.start, End: o.end, Root: o.d.RootName},
+		WAL:           render.WAL{State: wal.State, Bytes: wal.Bytes, Newest: wal.Newest, Sampled: wal.Sampled},
+	}
 }
 
 // flagError turns a flag package error into a usage error, and a request for help into success.

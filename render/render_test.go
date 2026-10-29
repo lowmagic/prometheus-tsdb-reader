@@ -27,7 +27,7 @@ func TestSampleValues(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := Instant(&out, Summary{}, r); err != nil {
+	if err := Instant(&out, Summary{}, "", at, r); err != nil {
 		t.Fatalf("Instant() = %v, want nil", err)
 	}
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")[1:]
