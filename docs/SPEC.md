@@ -63,6 +63,7 @@ Global flags:
 | `--dump PATH` | An extracted directory or a `.tar.gz` | required |
 | `--scratch DIR` | The only place the tool writes | the working directory |
 | `--no-wal` | Don't replay the WAL | off |
+| `--queries FILE` | A named-query file in place of the embedded one ([NAMED-12](#named-queries)) | the embedded file |
 | `--max-extract-bytes N` | Largest archive the tool will extract | 32 GiB |
 | `--max-series N` | Series per result before truncation | 100 |
 | `--max-points N` | Points per result before truncation | 20000 |
@@ -135,8 +136,10 @@ what it left out.
   usually carries none. The result says when the dump has no metadata at all, which is a different answer from
   a metric having none.
 - **QUERY-6: Free-form PromQL sits behind one flag.** The only way an expression or selector string enters the
-  tool is `--promql`. Named queries never take one. A caller that denies `--promql` can run only named queries,
-  `info`, `query labels` without a selector and `query metadata`.
+  tool through argv is `--promql`. Named queries never take one. A caller that denies `--promql` can run only
+  named queries, `info`, `query labels` without a selector and `query metadata`. The other way PromQL reaches
+  the tool is a named-query file ([NAMED-12](#named-queries)); a caller that wants only the shipped queries
+  denies `--queries` too.
 - **QUERY-7: Every result names its PromQL version.** The engine is the one Prometheus release the binary
   embeds (see [stack.md](stack.md#adr-003-one-embedded-promql-version)), which isn't necessarily the cluster's.
   Every summary carries `promql_version`, the version of the Prometheus module the binary was built with.
@@ -149,16 +152,25 @@ handling, and the warnings and infos it attaches to a result, which pass through
 
 ## Named queries
 
-A named query is a PromQL expression the tool assembles from typed flags, so a caller that can only pass whole
-argument values still gets a correct, escaped expression.
+A named query is a PromQL expression from a data file, narrowed by typed flags, so a caller that can only pass
+whole argument values still gets a correct, escaped expression.
 
-- **NAMED-1: Typed flags build matchers.** Each named query takes the flags in the table below and nothing else
-  that reaches the expression. An exact flag (`--namespace`, `--instance`) becomes an `=` matcher with the value
-  escaped by PromQL's string rules. A regex flag (`--pod`, `--device`, `--mount`) becomes an `=~` matcher with
-  the value escaped as a PromQL string and left to PromQL to anchor. A flag left unset adds no matcher. The
-  evaluated expression appears in the summary exactly as it was run, so a reader can paste it into Prometheus.
-  A named query that needs two expressions (used and limit) runs both and reports both; the output never hides
-  one side to make the other fit.
+- **NAMED-1: Typed flags become matchers through the parser.** Each named query takes the flags its definition
+  lists and nothing else that reaches the expression. The tool parses the definition's PromQL with Prometheus's
+  own parser, adds one matcher per set flag to every vector selector in the expression, sets every range
+  selector's range to `--window`, and prints the result with the parser's printer. An exact flag
+  (`--namespace`, `--instance`) becomes an `=` matcher; a regex flag (`--pod`, `--device`, `--mount`) becomes an
+  `=~` matcher, left to PromQL to anchor. Escaping is the printer's, so no layer concatenates PromQL text. A
+  flag left unset adds no matcher. The evaluated expression appears in the summary exactly as it was run, so a
+  reader can paste it into Prometheus. A named query that needs two expressions (used and limit) runs both and
+  reports both; the output never hides one side to make the other fit.
+- **NAMED-12: Named queries are a data file.** The definitions live in a JSON file. The binary embeds the
+  shipped one, so it still needs nothing beside it (RUN-1), and `--queries FILE` reads another in its place, so
+  an engineer can add or change a query without a release. A definition names the query, its expressions
+  (each with a name, PromQL, and the flags that apply to it, since a `device` matcher on a series without that
+  label matches nothing), and optionally a pair of expressions to compare, which is how `pod-cpu` reports pods
+  with no limit. The file's flags are declared once, each with the label it matches and whether it matches
+  exactly or by regex. The file's shape is interface. The shipped file's contents are the table below.
 
 | ID | Name | Flags | Expressions, with `W` for `--window` |
 | --- | --- | --- | --- |
@@ -173,9 +185,10 @@ argument values still gets a correct, escaped expression.
 | NAMED-10 | `node-rules` | `--instance`, `--device` | the node-exporter recording rules: `instance:node_cpu_utilisation:rate1m`, `instance:node_memory_utilisation:ratio`, `instance:node_network_receive_bytes_excluding_lo:rate1m`, `instance:node_network_transmit_bytes_excluding_lo:rate1m`, `instance:node_network_receive_drop_excluding_lo:rate1m`, `instance:node_network_transmit_drop_excluding_lo:rate1m`, `instance_device:node_disk_io_time_seconds:rate1m` and `instance_device:node_disk_io_time_weighted_seconds:rate1m`, each `{...}`; `--device` applies to the `instance_device` ones |
 | NAMED-11 | `vm-filesystem` | `--namespace`, `--mount` | used: `kubevirt_vmi_filesystem_used_bytes{...} / kubevirt_vmi_filesystem_capacity_bytes{...}`; free: `1 -` the same; both by `(namespace, name, mount_point)` |
 
-`...` stands for the matchers the flags add. For `pod-cpu` and `pod-memory`, a pod that has a `used` series but
-no `limit` series is listed by name in the summary, so a pod with no limit is reported rather than dropped by a
-division that finds nothing to divide by.
+`...` stands for the matchers the flags add. For `pod-cpu` and `pod-memory`, the definition compares `used`
+with `limit` by `namespace` and `pod`, and a pod that has a `used` series but no `limit` series is listed by
+name in the summary, so a pod with no limit is reported rather than dropped by a division that finds nothing to
+divide by.
 
 Two of these correct the working notes they come from, and one fixes them. `node-cpu` and `node-iowait` are
 already per-CPU averages, so dividing by the CPU count again is wrong. `node-disk-write-latency` must use the
@@ -263,7 +276,7 @@ with a block made corrupt, a WAL made unreadable, and the layouts of DUMP-3. A r
 - the kinds of damage real dumps carry, so DAMAGE-1 and DAMAGE-3 are checked against real damaged dumps when
   one turns up;
 - the WAL sizes and memory use of a busy cluster, so the limit defaults are tuned from real runs;
-- whether the embedded PromQL version answers as the cluster's would, which is the open question below.
+- whether the embedded PromQL version answers as the cluster's would, which is an unknown below.
 
 ## Unknowns
 
@@ -274,18 +287,16 @@ What the spec assumes without having checked, to verify at the pinned Prometheus
   features the older cluster didn't have, such as native histograms and out-of-order samples.
 - That the pod and node metric and label names in the named queries match what OpenShift's monitoring stack
   and KubeVirt export (`mount_point` in particular).
+- That the embedded engine evaluates a support query as the cluster's older engine would. Prometheus 3.0's
+  migration guide lists the PromQL changes from 2.x; which of them a support query would notice is unchecked
+  (see [stack.md](stack.md#adr-003-one-embedded-promql-version)).
 
 ## Open questions
 
 Raised here, not decided:
 
-- **The binary's name.** `package main` at the root makes it `prometheus-tsdb-reader`, which is long to type at
-  a support console. A shorter name would be a repo-level decision.
-- **Library or internal.** Whether the packages under the CLI are a public Go API or stay under `internal/`
-  until a second consumer needs them.
-- **One PromQL version or builds per release.** Whether PromQL behavior differs across the Prometheus versions
-  OpenShift ships, in ways a support query would notice, and if it does, whether that calls for one binary per
-  Prometheus release rather than one embedded version (see
-  [stack.md](stack.md#adr-003-one-embedded-promql-version)).
-- **Named queries in code or in a data file.** Whether the named queries are compiled in, or read from a data
-  file an engineer can extend without a release.
+- **The binary's name.** `package main` at the root makes the binary the repo's name, and
+  `prometheus-tsdb-reader` is long to type at a support console. The candidate is `tsdbr`: short, lowercase,
+  and it says what it is. Taking it means renaming the repo and module so the three agree, or keeping the repo
+  name and building the binary from `cmd/tsdbr`, which [standards.md](standards.md#known-deviations) would
+  record as a deviation from one binary at the root.

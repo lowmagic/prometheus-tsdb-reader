@@ -41,15 +41,27 @@ blocks one at a time around its errors rather than relying on it to skip them.
 
 ## ADR-003: One embedded PromQL version
 
-The binary embeds one Prometheus release's engine: the newest stable release at the time `go.mod` is pinned,
+The binary embeds one Prometheus release's engine: the current stable release at the time `go.mod` is pinned,
 bumped deliberately and not by every dependency update. Every result names that version (QUERY-7), because the
 cluster that wrote the dump ran whichever release its OpenShift version ships, and the two may differ.
 
-Pinning the newest release rather than the one a given cluster runs is a bet that one engine reads every
+Pinning the current release rather than the one a given cluster runs is a bet that one engine reads every
 dump: Prometheus 3's migration guide says 3.x reads storage written by 2.x, and a newer reader is at least as
-new as any cluster's writer, so a dump never uses a storage feature the reader lacks. The bet in the other
-direction, that the newer engine evaluates a support query the same way the cluster's would, is the
-[open question](SPEC.md#open-questions) the spec records. Prometheus 3.0's migration guide lists the PromQL
-changes from 2.x; which of them a support query would notice is unknown until checked. If the differences
-matter, the alternative is one build per Prometheus release that OpenShift ships, with the release in the
-binary's name, and this record changes.
+new as any cluster's writer, so a dump never uses a storage feature the reader lacks. Whether the newer engine
+evaluates a support query the same way the cluster's would is an [unknown](SPEC.md#unknowns) the spec records.
+One build per Prometheus release is the fallback if a checked difference matters, and this record changes
+then.
+
+The release's semver covers the server, not the Go module. Prometheus tags the module at major version 0
+(release v3.15.1 is module `v0.315.1`), which is Go's signal that the API may change between any two versions.
+So each bump of the pin is expected to touch the `store` and `query` layers, and the pin moves on its own
+commit, with the API changes it needed.
+
+## ADR-004: Named queries are data
+
+The named queries live in a JSON file the binary embeds, and `--queries` reads another in its place
+([NAMED-12](SPEC.md#named-queries)). An engineer adds a query by editing a file, with no release. JSON because
+`encoding/json` is in the stdlib and the file is small. The flags don't reach the expression as text: the
+tool parses the file's PromQL with Prometheus's parser, adds matchers to the syntax tree and prints it back,
+so escaping is the parser's and there is no string templating to get wrong. The file's shape is interface,
+and changing it is an interface change.

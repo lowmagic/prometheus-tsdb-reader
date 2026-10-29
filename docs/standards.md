@@ -16,21 +16,22 @@ Where it differs from an org rule, it says so, and it wins.
 ## Structure
 
 The layers, in the order data flows. Each one talks to the next through an explicit interface and knows
-nothing of the others' internals. One package per layer, named for the layer; whether they live under
-`internal/` is an [open question](SPEC.md#open-questions).
+nothing of the others' internals. One package per layer, named for the layer, at the module root: the library
+is public API, so an exported identifier is interface and changing it is an interface change.
 
 | Layer | Owns | Mustn't know |
 | --- | --- | --- |
 | `dump` | Accepting a path or archive, extracting safely under scratch, finding the TSDB root, listing blocks and the WAL | PromQL, the output format, flags |
 | `store` | Opening the TSDB read-only with the scratch root, skipping corrupt blocks, replaying or skipping the WAL, the dump's range and gaps | archives and layouts, PromQL text, the output format |
 | `query` | Running an expression through the engine, time defaults, step defaults and warnings, limits and truncation, empty reasons | files, archives, flags, JSON |
-| `named` | Turning typed values into escaped matchers and the spec's expressions | storage, output, flags |
+| `named` | Reading the query file, adding typed values to an expression's syntax tree as matchers | storage, output, flags |
 | `render` | Writing the summary and records as JSON lines | where a result came from, the engine |
 | CLI (`main`) | Flags, wiring the layers, exit codes, stderr progress | the internals of any of them |
 
 - One code path evaluates a query, whether it came from `--promql` or a named query: `named` produces an
   expression and `query` runs it. A named query is never a second evaluator.
-- The only place a PromQL string is built from parts is `named`. Nowhere else concatenates matchers.
+- No layer builds PromQL from strings. `named` edits a parsed syntax tree and prints it; nowhere concatenates
+  matchers.
 - Scratch is passed down from `main`. No layer picks its own writable place, and no layer writes under the
   dump.
 
@@ -45,7 +46,7 @@ nothing of the others' internals. One package per layer, named for the layer; wh
 - The behaviors worth a test: safe extraction (traversal, links out, size), finding the TSDB root in each
   layout, never writing under the dump, a corrupt block becoming a gap, `--no-wal` and a failed WAL being
   reported, the three empty reasons, each limit and its truncation record, the step warnings, matcher escaping,
-  the PromQL version in the summary, and the output's shape.
+  the PromQL version in the summary, the output's shape, and that the shipped query file loads.
 - The JSON lines output is interface: another program reads it, so a test may pin its shape. Warning and
   progress text is checked by meaning (the warning's code), not its wording.
 - Fixtures are synthetic, built with the `tsdb` package in a test helper, never checked in as binary blobs

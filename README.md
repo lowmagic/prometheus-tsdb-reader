@@ -26,8 +26,9 @@ with typed flags.
   finer one adds nothing. The summary says which.
 - **Named queries from typed flags.** Pod CPU and memory against limits, node CPU, iowait, load, memory,
   network and disk latency, the node-exporter recording rules, and KubeVirt VM filesystems, each built from
-  flags such as `--namespace`, `--pod` and `--window` with proper escaping. Free-form PromQL sits behind
-  `--promql`, one flag a caller can deny.
+  flags such as `--namespace`, `--pod` and `--window` with proper escaping. They come from a file the binary
+  embeds, and `--queries` reads an edited one. Free-form PromQL sits behind `--promql`, one flag a caller can
+  deny.
 - **Names its PromQL version.** The embedded engine is one Prometheus release, not necessarily the cluster's,
   and every result says which.
 
@@ -51,7 +52,8 @@ prometheus-tsdb-reader --dump ./dump.tar.gz --scratch /tmp/work query range \
 Each command prints a summary line first, then one JSON record per series; progress goes to stderr. Times
 default to the dump's end, not to now. The [specification](docs/SPEC.md) lists every command, flag, default,
 warning and empty reason; the [roadmap](docs/ROADMAP.md) gives the order they get built in; and
-[stack and decisions](docs/stack.md) records why it's Go on Prometheus's own packages.
+[stack and decisions](docs/stack.md) records why it's Go on Prometheus's own packages. The packages under
+the CLI are a public Go API.
 
 `make check` runs the checks CI runs, offline. `make standards` checks the org standards copies and needs the
 network.

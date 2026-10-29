@@ -94,14 +94,15 @@ prometheus-tsdb-reader --dump ./dump named node-cpu --window 5m --start 6h
 ```
 
 The summary shows the exact expression that ran, and a pod with no limit is named in the summary rather than
-missing.
+missing. The queries come from a file the binary embeds, and `--queries` points at an edited copy.
 
-Delivers: NAMED-1 through NAMED-9.
+Delivers: NAMED-1 through NAMED-9 and NAMED-12.
 
 Done when: each named query runs against a fixture carrying its metrics and the summary's expression is the
 one the spec's table gives; a `--namespace` value with a quote and a backslash in it produces a correctly
-escaped matcher; a fixture pod with no limit series appears in the summary's list; and `node-disk-write-latency`
-with `--instance` set returns a result on a fixture where both sides exist.
+escaped matcher; a fixture pod with no limit series appears in the summary's list; `node-disk-write-latency`
+with `--instance` set returns a result on a fixture where both sides exist; and a copy of the shipped file with
+one query added runs that query through `--queries`.
 
 ## 7. Recording rules, VM filesystems and metadata
 
