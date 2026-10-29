@@ -79,4 +79,23 @@ is public API, so an exported identifier is interface and changing it is an inte
 Where prometheus-tsdb-reader doesn't follow the org standards yet. These are debt to pay down, not overrides:
 each one should go.
 
-None yet.
+- Versions and pins: `.github/workflows/check.yml:16` installs golangci-lint as `version: v2.15`, a minor line
+  rather than the exact version or commit a tool is pinned to.
+- Errors and recovery: `median` in `query/explain.go:259` ends its impossible case by returning `0, false`, the
+  answer for "no gaps", instead of raising.
+- Privacy: the fixture's and the spec's `instance` labels are bare invented host names (`node-a` to `node-d`, in
+  `internal/fixture/fixture.go:54-56,62,92`, `main_test.go` and `docs/SPEC.md:378-379`), not names under
+  `example.com`.
+- Docs: [ROADMAP.md](ROADMAP.md)'s eight slices have no `Status:` line.
+- Go errors: `query/listing.go:139` calls `labels.MustNewMatcher` with a label name from the command line, and
+  `main_test.go:54` calls `regexp.MustCompile` inside a test; `MustX` is only for package-level values built from
+  constants.
+- Go errors: `dump/extract.go:97` discards `Peek`'s error and `main_test.go:44` discards `os.ReadDir`'s, with no
+  comment saying why that's safe.
+- Go concurrency: `Store.replay`, which `store.Open` calls, starts a goroutine for `Head.Init`
+  (`store/store.go:394`) that nothing can tell to stop and nobody waits for once the context is cancelled, as the
+  comment above it says. It's also a goroutine started from a constructor, where the org wants synchronous functions.
+- Go testing: `TestRelease` (`query/version_test.go:14`) runs its table without named subtests, so `go test -run`
+  can't select a case.
+- Go testing: twelve calls in `main_test.go` (from line 687) fail with `t.Fatal(err)`, which doesn't name the call,
+  its input or what was wanted.
