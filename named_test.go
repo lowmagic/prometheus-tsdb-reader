@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 
@@ -52,6 +54,7 @@ func TestNamedExpressions(t *testing.T) {
 	dumpDir := writeNamed(t)
 	const ns, pods, node = `namespace="shop", pod=~"checkout-.*"`, "--pod", "node-1.example.com"
 	const inst = `instance="node-1.example.com"`
+	const vm = `namespace="vms", mount_point=~"/data"`
 	podFlags := []string{"--namespace", "shop", pods, "checkout-.*"}
 	tests := []struct {
 		name  string
@@ -85,6 +88,22 @@ func TestNamedExpressions(t *testing.T) {
 		{"node-network", []string{"--instance", node, "--device", "eth.*"}, map[string]string{
 			"receive":  `sum by (instance, device) (rate(node_network_receive_bytes_total{` + inst + `, device=~"eth.*"}[2m]))`,
 			"transmit": `sum by (instance, device) (rate(node_network_transmit_bytes_total{` + inst + `, device=~"eth.*"}[2m]))`,
+		}},
+		{"node-rules", []string{"--instance", node, "--device", "sd.*"}, map[string]string{
+			"cpu_utilisation":        `instance:node_cpu_utilisation:rate1m{` + inst + `}`,
+			"memory_utilisation":     `instance:node_memory_utilisation:ratio{` + inst + `}`,
+			"network_receive_bytes":  `instance:node_network_receive_bytes_excluding_lo:rate1m{` + inst + `}`,
+			"network_transmit_bytes": `instance:node_network_transmit_bytes_excluding_lo:rate1m{` + inst + `}`,
+			"network_receive_drop":   `instance:node_network_receive_drop_excluding_lo:rate1m{` + inst + `}`,
+			"network_transmit_drop":  `instance:node_network_transmit_drop_excluding_lo:rate1m{` + inst + `}`,
+			"disk_io_time":           `instance_device:node_disk_io_time_seconds:rate1m{` + inst + `, device=~"sd.*"}`,
+			"disk_io_time_weighted":  `instance_device:node_disk_io_time_weighted_seconds:rate1m{` + inst + `, device=~"sd.*"}`,
+		}},
+		{"vm-filesystem", []string{"--namespace", "vms", "--mount", "/data"}, map[string]string{
+			"used": `sum by (namespace, name, mount_point) (kubevirt_vmi_filesystem_used_bytes{` + vm + `}) / ` +
+				`sum by (namespace, name, mount_point) (kubevirt_vmi_filesystem_capacity_bytes{` + vm + `})`,
+			"free": `1 - sum by (namespace, name, mount_point) (kubevirt_vmi_filesystem_used_bytes{` + vm + `}) / ` +
+				`sum by (namespace, name, mount_point) (kubevirt_vmi_filesystem_capacity_bytes{` + vm + `})`,
 		}},
 		{"node-disk-write-latency", []string{"--instance", node, "--device", "sda"}, map[string]string{
 			"write_latency": `rate(node_disk_write_time_seconds_total{` + inst + `, device=~"sda"}[2m]) / ` +
@@ -239,6 +258,44 @@ func TestNamedBadArguments(t *testing.T) {
 			}
 			if stdout.Len() != 0 {
 				t.Errorf("run(%q) wrote %q to stdout, want nothing", args, &stdout)
+			}
+		})
+	}
+}
+
+// query metadata lists what the WAL's metadata records carry, and tells a dump with none from a metric with none.
+func TestQueryMetadata(t *testing.T) {
+	withMetadata := t.TempDir()
+	if err := fixture.Metadata(t.Context(), withMetadata); err != nil {
+		t.Fatalf("fixture.Metadata(%s) = %v", withMetadata, err)
+	}
+	without := writeFixture(t, 15*time.Second)
+	every := []map[string]any{}
+	for _, m := range fixture.MetadataMetrics {
+		every = append(every, map[string]any{"kind": "metadata", "metric": m.Name, "type": m.Type, "unit": m.Unit, "help": m.Help})
+	}
+	tests := []struct {
+		name    string
+		dump    string
+		args    []string
+		empty   any
+		records []map[string]any
+	}{
+		{"every metric", withMetadata, nil, nil, every},
+		{"one metric", withMetadata, []string{"--metric", "node_load1"}, nil, every[:1]},
+		{"a metric with none", withMetadata, []string{"--metric", "up"},
+			map[string]any{"reason": "no-metadata-for-metric", "selectors": []any{"up"}}, nil},
+		{"a dump with none", without, nil, map[string]any{"reason": "no-metadata", "selectors": []any{}}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--dump", tt.dump, "--scratch", t.TempDir(), "query", "metadata"}, tt.args...)
+			records := mustRun(t, args...)
+			if diff := gocmp.Diff(tt.empty, records[0]["empty"]); diff != "" {
+				t.Errorf("run(%q): empty (-want +got):\n%s", args, diff)
+			}
+			if diff := gocmp.Diff(tt.records, records[1:], cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("run(%q) records (-want +got):\n%s", args, diff)
 			}
 		})
 	}

@@ -121,6 +121,7 @@ commands:
                                           the series matching any of the selectors
   query labels [NAME] [--promql SELECTOR...] [--start T] [--end T]
                                           label names, or the values of NAME
+  query metadata [--metric NAME]          the metric metadata the dump carries, if any
   named NAME [query flags] [--start T] [--end T] [--step D] [--window D]
                                           a named query built from typed flags, over a range;
                                           named NAME --help lists its flags
@@ -136,6 +137,8 @@ type config struct {
 	noWAL    bool
 	queries  string
 	limits   query.Options
+	// metadata collects the WAL's metric metadata as the store decodes it.
+	metadata bool
 	logger   *slog.Logger
 }
 
@@ -186,12 +189,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 
 	rest := global.Args()
 	commands := map[string]func(context.Context, config, []string, io.Writer, io.Writer) error{
-		"info":          info,
-		"query instant": queryInstant,
-		"query range":   queryRange,
-		"query series":  querySeries,
-		"query labels":  queryLabels,
-		"named":         namedQuery,
+		"info":           info,
+		"query instant":  queryInstant,
+		"query range":    queryRange,
+		"query series":   querySeries,
+		"query labels":   queryLabels,
+		"query metadata": queryMetadata,
+		"named":          namedQuery,
 	}
 	for words := 1; words <= 2 && words <= len(rest); words++ {
 		if command, ok := commands[strings.Join(rest[:words], " ")]; ok {
@@ -322,6 +326,28 @@ func queryLabels(ctx context.Context, cfg config, args []string, stdout, stderr 
 		return err
 	}
 	return render.Labels(stdout, o.summary("query labels", o.gaps(l.Start, l.End)), l)
+}
+
+func queryMetadata(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
+	fs := newFlagSet("query metadata", stderr)
+	metric := fs.String("metric", "", "list only this metric's `name`")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+
+	cfg.metadata = true
+	o, err := cfg.open(ctx, false)
+	if err != nil {
+		return err
+	}
+	var all []query.Metadata
+	for _, m := range o.st.Metadata() {
+		all = append(all, query.Metadata{Metric: m.Metric, Type: m.Type, Unit: m.Unit, Help: m.Help})
+	}
+	if err := o.close(nil); err != nil {
+		return err
+	}
+	return render.Metadata(stdout, o.summary("query metadata", nil), query.ListMetadata(all, *metric))
 }
 
 // defaultWindow is the spec's default for --window, the range in a named query's rate.
@@ -524,7 +550,9 @@ func (c config) open(ctx context.Context, replay bool) (_ *opened, err error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := store.Open(ctx, d, store.Options{Scratch: c.dumpOpts.Scratch, Replay: replay, SkipWAL: c.noWAL}, c.logger)
+	st, err := store.Open(ctx, d, store.Options{
+		Scratch: c.dumpOpts.Scratch, Replay: replay, SkipWAL: c.noWAL, Metadata: c.metadata,
+	}, c.logger)
 	if err != nil {
 		return nil, err
 	}

@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"strings"
 
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -40,6 +42,11 @@ type walPass struct {
 	newestAfter int64
 	after       bool
 
+	// names and metadata are kept only when the pass collects metadata: each series' metric name by its
+	// reference, and the newest metadata record for each metric name.
+	names    map[chunks.HeadSeriesRef]string
+	metadata map[string]Metadata
+
 	// Decoding buffers, reused from record to record, so the pass allocates only when a record outgrows them.
 	series     []record.RefSeries
 	samples    []record.RefSample
@@ -47,7 +54,7 @@ type walPass struct {
 	floatHists []record.RefFloatHistogramSample
 	tombstones []tombstones.Stone
 	exemplars  []record.RefExemplar
-	metadata   []record.RefMetadata
+	refMeta    []record.RefMetadata
 }
 
 func (p *walPass) add(t int64) {
@@ -87,14 +94,18 @@ func (s segment) name() string { return wlog.SegmentName(s.dir, s.index) }
 // readWAL decodes every record in the segments a replay reads, the WAL's last checkpoint and the segments after
 // it, and returns what it found, counting as kept the samples a replay from minValid keeps. It decodes every
 // record type a replay decodes, so it fails where a replay fails. Past a failure it reads on from the next record
-// it can find, so the samples after it are known. It builds no head, so it holds one record at a time in memory.
-// An error opening a segment, rather than reading one, stops Prometheus's own replay too, and is returned.
-func readWAL(ctx context.Context, dir string, minValid int64, logger *slog.Logger) (walPass, error) {
+// it can find, so the samples after it are known. It builds no head, so it holds one record at a time in memory,
+// unless it collects metadata, when it also holds each series' metric name. An error opening a segment, rather
+// than reading one, stops Prometheus's own replay too, and is returned.
+func readWAL(ctx context.Context, dir string, minValid int64, collectMetadata bool, logger *slog.Logger) (walPass, error) {
 	segs, err := replayed(dir)
 	if err != nil {
 		return walPass{}, err
 	}
 	p := walPass{minValid: minValid}
+	if collectMetadata {
+		p.names, p.metadata = map[chunks.HeadSeriesRef]string{}, map[string]Metadata{}
+	}
 	dec := record.NewDecoder(nil, logger)
 	for _, seg := range segs {
 		if err := p.readSegment(ctx, &dec, seg); err != nil {
@@ -211,6 +222,11 @@ func (p *walPass) decode(dec *record.Decoder, rec []byte) error {
 	switch dec.Type(rec) {
 	case record.Series:
 		p.series, err = dec.Series(rec, p.series[:0])
+		if p.names != nil {
+			for _, s := range p.series {
+				p.names[s.Ref] = strings.Clone(s.Labels.Get(model.MetricNameLabel))
+			}
+		}
 	case record.Samples, record.SamplesV2:
 		p.samples, err = dec.Samples(rec, p.samples[:0])
 		for _, s := range p.samples {
@@ -231,7 +247,18 @@ func (p *walPass) decode(dec *record.Decoder, rec []byte) error {
 	case record.Exemplars:
 		p.exemplars, err = dec.Exemplars(rec, p.exemplars[:0])
 	case record.Metadata:
-		p.metadata, err = dec.Metadata(rec, p.metadata[:0])
+		p.refMeta, err = dec.Metadata(rec, p.refMeta[:0])
+		if p.metadata != nil {
+			for _, m := range p.refMeta {
+				// A series record always comes before the records that refer to it.
+				if name := p.names[m.Ref]; name != "" {
+					p.metadata[name] = Metadata{
+						Metric: name, Type: string(record.ToMetricType(m.Type)),
+						Unit: strings.Clone(m.Unit), Help: strings.Clone(m.Help),
+					}
+				}
+			}
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("decode %s: %w", dec.Type(rec), err)

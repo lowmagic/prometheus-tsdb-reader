@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -104,6 +105,13 @@ type Options struct {
 	// SkipWAL leaves the WAL out of the dump: it isn't replayed, and the dump ends with its blocks. It is still
 	// decoded for its own range.
 	SkipWAL bool
+	// Metadata collects the metric metadata the WAL's records carry as it's decoded, for Metadata.
+	Metadata bool
+}
+
+// Metadata is a metric's type, unit and help, from the newest metadata record any of its series has in the WAL.
+type Metadata struct {
+	Metric, Type, Unit, Help string
 }
 
 // Store is a dump's blocks and head, read without writing under the dump. It is a storage.Queryable.
@@ -116,6 +124,8 @@ type Store struct {
 	head   *tsdb.Head
 	runDir string
 	wal    WAL
+	// metadata is the WAL's metadata by metric name, when collected.
+	metadata map[string]Metadata
 	// mint and maxt are the first and last sample times in the blocks and the WAL.
 	mint, maxt int64
 }
@@ -151,10 +161,11 @@ func Open(ctx context.Context, d dump.Dump, opts Options, logger *slog.Logger) (
 	}
 	logger.Info("reading WAL", "bytes", s.wal.Bytes)
 	minValid := s.minValid()
-	pass, err := readWAL(ctx, d.WAL, minValid, tsdbLogger)
+	pass, err := readWAL(ctx, d.WAL, minValid, opts.Metadata, tsdbLogger)
 	if err != nil {
 		return nil, fmt.Errorf("read WAL: %w", err)
 	}
+	s.metadata = pass.metadata
 	if pass.sampled {
 		s.wal.Newest, s.wal.Sampled = timestamp.Time(pass.newest).UTC(), true
 	}
@@ -451,6 +462,12 @@ func (s *Store) Range() (start, end time.Time, ok bool) {
 
 // WAL says what was done with the WAL, how big it is and its newest sample.
 func (s *Store) WAL() WAL { return s.wal }
+
+// Metadata returns the metric metadata the WAL carries, sorted by metric, when Options.Metadata asked for it. A
+// dump with no WAL, or whose WAL has no metadata records, has none.
+func (s *Store) Metadata() []Metadata {
+	return slices.SortedFunc(maps.Values(s.metadata), func(a, b Metadata) int { return cmp.Compare(a.Metric, b.Metric) })
+}
 
 // Blocks returns every block with its status: those with a range in start order, then those without.
 func (s *Store) Blocks() []Block { return s.listed }
