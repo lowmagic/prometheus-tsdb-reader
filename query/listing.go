@@ -27,6 +27,8 @@ type Listing struct {
 	Labels []string
 	// Empty says why the listing is empty, and is nil when it isn't.
 	Empty *Empty
+	// Truncated is the limit that cut a series listing, and is nil when none did.
+	Truncated *Truncation
 }
 
 // Series lists the series matching any of the selectors with samples between start and end.
@@ -58,6 +60,7 @@ func (e *Engine) Series(ctx context.Context, d Dump, selectors []string, start, 
 		// The listing is empty, so no selector matched a series in the range.
 		l.Empty, err = explain(ctx, d, sels, mint, maxt, func() ([]selector, error) { return sels, nil })
 	}
+	e.truncateListing(l)
 	return l, err
 }
 

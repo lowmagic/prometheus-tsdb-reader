@@ -302,6 +302,18 @@ interfaces, and a reader who wants a node total sums the result, since a sum ove
 by `namespace` and `pod`, and a pod that has a `used` series but no `limit` series is listed by name in the
 summary, so a pod with no limit is reported rather than dropped by a division that finds nothing to divide by.
 
+A named query's summary has `expressions` in place of `expression`: each with its `name`, the `promql` that ran
+and its own `empty` reason or null, so an expression that found nothing is never just absent. The top-level
+`empty` is set only when every expression is empty, and is the first one's. `series` and `points` count all
+the expressions' records, and each record names its `expression`. The limits are shared: each expression keeps
+at most an even share of `--max-series` and `--max-points`, so a cut never drops one side and the whole output
+still fits; `truncated` names the first limit that cut, the flag's value, and the series or points all the
+expressions had in full. `unpaired` is computed before the cut, so a pod whose limit series was cut isn't
+reported as having none. `sample_interval` is the finest of the expressions', and with more than one
+expression each warning's message starts with the expression's name. A single expression is named for what it
+measures: `busy` for `node-cpu`, `iowait`, `load1` to `load1_per_cpu`, `used` and `available` for `node-memory`,
+`receive` and `transmit`, and `write_latency`.
+
 Two of these correct the working notes they come from, and one fixes them. `node-cpu` and `node-iowait` are
 already per-CPU averages, so dividing by the CPU count again is wrong. `node-disk-write-latency` must use the
 same matchers on both sides; with different instances on each side the division matches nothing.
@@ -389,8 +401,9 @@ replay and by `--no-wal`. The runtime's soft memory limit isn't offered: it can'
 only slow the process down near it, and a sandbox that caps memory already does so with its own cgroup. Hitting
 a limit is reported, never silent.
 
-- **LIMIT-1: Series limit.** A result has at most `--max-series` series. The default keeps the output readable
-  and, with LIMIT-2, under the sandboxed caller's cap.
+- **LIMIT-1: Series limit.** A result has at most `--max-series` series, and so does a series listing. The
+  default keeps the output readable and, with LIMIT-2, under the sandboxed caller's cap. A label listing isn't
+  cut: it is one record of names or values, not one per series.
 - **LIMIT-2: Point limit.** A range result has at most `--max-points` points across all series. The default is
   chosen so that a full result stays under 1 MiB of JSON lines, which is why the two limits interlock: at
   STEP-1's 500 points per series, the point limit holds forty series, so a day-long query over a hundred series

@@ -3,6 +3,7 @@ package query
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -60,6 +61,8 @@ type Result struct {
 	HasSampleInterval bool
 	// Empty says why the result is empty, and is nil when it isn't.
 	Empty *Empty
+	// Truncated is the limit that cut the result, and is nil when none did.
+	Truncated *Truncation
 	// Warnings are the step warnings, the sample interval's, then the engine's annotations, sorted, under the
 	// code "promql".
 	Warnings []Warning
@@ -136,13 +139,20 @@ type Bucket struct {
 type Engine struct {
 	ng     *promql.Engine
 	parser parser.Parser
+	opts   Options
 }
 
-// NewEngine returns an engine configured with Prometheus's server defaults.
-func NewEngine() *Engine {
+// NewEngine returns an engine configured with Prometheus's server defaults, which cuts no result.
+func NewEngine() *Engine { return NewEngineWithOptions(Options{}) }
+
+// NewEngineWithOptions returns an engine configured with Prometheus's server defaults and opts's limits.
+func NewEngineWithOptions(opts Options) *Engine {
+	if opts.MaxSamples <= 0 {
+		opts.MaxSamples = defaultMaxSamples
+	}
 	p := parser.NewParser(parser.Options{ExperimentalDurationExpr: true})
-	return &Engine{parser: p, ng: promql.NewEngine(promql.EngineOpts{
-		MaxSamples:    defaultMaxSamples,
+	return &Engine{parser: p, opts: opts, ng: promql.NewEngine(promql.EngineOpts{
+		MaxSamples:    opts.MaxSamples,
 		Timeout:       noTimeout,
 		LookbackDelta: lookbackDelta,
 		NoStepSubqueryIntervalFn: func(int64) int64 {
@@ -162,11 +172,12 @@ func (e *Engine) Instant(ctx context.Context, d Dump, expr string, at Time) (*Re
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", expr, err)
 	}
-	res, err := execute(ctx, d, qry, expr)
+	res, err := e.execute(ctx, d, qry, expr)
 	if err != nil {
 		return nil, err
 	}
 	res.Time = t
+	truncate(res, e.opts)
 	return res, nil
 }
 
@@ -179,6 +190,63 @@ type Span struct {
 
 // Range evaluates expr over d across span.
 func (e *Engine) Range(ctx context.Context, d Dump, expr string, span Span) (*Result, error) {
+	res, err := e.rangeOf(ctx, d, expr, span)
+	if err != nil {
+		return nil, err
+	}
+	truncate(res, e.opts)
+	return res, nil
+}
+
+// Ranges evaluates each of exprs over d across span, as one result each, in order and uncut; Share cuts them.
+func (e *Engine) Ranges(ctx context.Context, d Dump, exprs []string, span Span) ([]*Result, error) {
+	out := make([]*Result, 0, len(exprs))
+	for _, expr := range exprs {
+		res, err := e.rangeOf(ctx, d, expr, span)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, res)
+	}
+	return out, nil
+}
+
+// Share cuts results that together answer one question, as Ranges returns them, to the engine's limits. Each
+// keeps at most its even share of the series and the points, so every result has a place in the output and
+// together they fit the limits. The Truncation is nil when no result was cut, and otherwise names the first
+// limit that cut one, its value, and how many of the limit's series or points the results had in full.
+func (e *Engine) Share(results []*Result) *Truncation {
+	share := e.opts
+	share.MaxSeries = shareOf(share.MaxSeries, len(results))
+	share.MaxPoints = shareOf(share.MaxPoints, len(results))
+	var cut *Truncation
+	series, points := 0, 0
+	for _, res := range results {
+		series, points = series+len(res.Series), points+res.Points()
+		truncate(res, share)
+		if cut == nil && res.Truncated != nil {
+			cut = &Truncation{Limit: res.Truncated.Limit}
+		}
+	}
+	if cut != nil {
+		cut.Value, cut.Full = e.opts.MaxSeries, series
+		if cut.Limit == LimitPoints {
+			cut.Value, cut.Full = e.opts.MaxPoints, points
+		}
+	}
+	return cut
+}
+
+// shareOf is one of n even shares of limit, at least 1; a zero limit is no limit, and so is each share.
+func shareOf(limit, n int) int {
+	if limit <= 0 {
+		return 0
+	}
+	return max(1, limit/n)
+}
+
+// rangeOf evaluates expr over d across span, uncut.
+func (e *Engine) rangeOf(ctx context.Context, d Dump, expr string, span Span) (*Result, error) {
 	start, end, err := bounds(d, span.Start, span.End)
 	if err != nil {
 		return nil, err
@@ -191,7 +259,7 @@ func (e *Engine) Range(ctx context.Context, d Dump, expr string, span Span) (*Re
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", expr, err)
 	}
-	res, err := execute(ctx, d, qry, expr)
+	res, err := e.execute(ctx, d, qry, expr)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +270,7 @@ func (e *Engine) Range(ctx context.Context, d Dump, expr string, span Span) (*Re
 
 // execute runs a prepared query, then reads its selectors once more for the sample interval and, when the
 // result is empty, the reason.
-func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Result, error) {
+func (e *Engine) execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Result, error) {
 	defer qry.Close()
 	// The engine rewrites the statement as it evaluates, as when it replaces a subquery with the series it
 	// computed, so the selectors and their windows are read before it runs.
@@ -214,6 +282,9 @@ func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Resul
 	start, end := stmt.Start.UnixMilli(), stmt.End.UnixMilli()
 
 	res := qry.Exec(ctx)
+	if tooMany := promql.ErrTooManySamples(""); errors.As(res.Err, &tooMany) {
+		return nil, &LimitError{Limit: LimitSamples, Value: e.opts.MaxSamples, Err: res.Err}
+	}
 	if res.Err != nil {
 		return nil, fmt.Errorf("evaluate %q: %w", expr, res.Err)
 	}
