@@ -77,6 +77,7 @@ func TestQueryInstant(t *testing.T) {
 			"time":            end,
 			"series":          2.0,
 			"points":          2.0,
+			"truncated":       nil,
 			"empty":           nil,
 			"sample_interval": "15s",
 			"warnings":        []any{},
@@ -132,6 +133,8 @@ func TestBadArguments(t *testing.T) {
 		{"promql with =", []string{"--dump", ".", "query", "instant", "--promql=up"}},
 		{"single-dash promql with =", []string{"--dump", ".", "query", "instant", "-promql=up"}},
 		{"series with =", []string{"--dump", ".", "query", "series", "--promql", "up", "--promql=up"}},
+		{"zero series limit", []string{"--dump", ".", "--max-series", "0", "query", "instant", "--promql", "up"}},
+		{"negative point limit", []string{"--dump", ".", "--max-points", "-1", "query", "instant", "--promql", "up"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1066,5 +1069,161 @@ func TestInterruptedWALRead(t *testing.T) {
 	records := decodeLines(t, stdout.Bytes())
 	if len(records) != 1 || records[0]["kind"] != "error" || records[0]["exit"] != 1.0 {
 		t.Errorf("run(%q) interrupted as it reads the WAL: stdout %v, want one error record with exit 1", args, records)
+	}
+}
+
+// writeWide writes a dump of n series of fixture.WideMetric.
+func writeWide(t *testing.T, n int) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := fixture.Wide(t.Context(), dir, n); err != nil {
+		t.Fatalf("fixture.Wide(%s, %d) = %v", dir, n, err)
+	}
+	return dir
+}
+
+// wideSeries is the series label of each series record, in order.
+func wideSeries(records []map[string]any) []string {
+	var names []string
+	for _, r := range records {
+		if r["kind"] == "series" {
+			name, _ := field(r, "metric", "series").(string)
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// wideNames is s000 up to the n-th series' name, the first n in label order.
+func wideNames(n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("s%03d", i)
+	}
+	return names
+}
+
+// A limit that cuts a result keeps whole series, the first in label order, and says so in the summary.
+func TestTruncation(t *testing.T) {
+	const width = 150
+	dumpDir := writeWide(t, width)
+	// The default range is the 2h before the dump's end at a 1m step: 121 points per series.
+	const perSeries = 121
+	tests := []struct {
+		name      string
+		args      []string
+		kept      int
+		truncated any
+	}{
+		{
+			"range over the series limit", []string{"query", "range", "--promql", fixture.WideMetric},
+			100, map[string]any{"limit": "series", "value": 100.0, "full": float64(width)},
+		},
+		{
+			"range over the point limit", []string{"--max-points", "1000", "query", "range", "--promql", fixture.WideMetric},
+			1000 / perSeries, map[string]any{"limit": "points", "value": 1000.0, "full": float64(width * perSeries)},
+		},
+		{
+			"instant sorted by value", []string{"--max-series", "5", "query", "instant", "--promql", "sort_desc(" + fixture.WideMetric + ")"},
+			5, map[string]any{"limit": "series", "value": 5.0, "full": float64(width)},
+		},
+		{
+			"series listing", []string{"query", "series", "--promql", fixture.WideMetric},
+			100, map[string]any{"limit": "series", "value": 100.0, "full": float64(width)},
+		},
+		{"within the limits", []string{"--max-series", "200", "query", "range", "--promql", fixture.WideMetric}, width, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir()}, tt.args...)
+			// Twice, since an instant result is cut in the same place on every run.
+			for range 2 {
+				records := mustRun(t, args...)
+				if diff := cmp.Diff(tt.truncated, records[0]["truncated"]); diff != "" {
+					t.Errorf("run(%q): truncated (-want +got):\n%s", args, diff)
+				}
+				if diff := cmp.Diff(wideNames(tt.kept), wideSeries(records[1:])); diff != "" {
+					t.Errorf("run(%q): series kept (-want +got):\n%s", args, diff)
+				}
+				if got := records[0]["series"]; got != float64(tt.kept) {
+					t.Errorf("run(%q): summary series = %v, want %d", args, got, tt.kept)
+				}
+			}
+		})
+	}
+}
+
+// A query that loads more samples than --max-samples exits 3 with an error record naming the limit.
+func TestMaxSamples(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	var stdout, stderr bytes.Buffer
+	args := []string{"--dump", dumpDir, "--scratch", t.TempDir(), "--max-samples", "10", "query", "range", "--promql", "up"}
+	err := run(t.Context(), args, &stdout, &stderr)
+	if code := exitCode(err); code != exitLimit {
+		t.Fatalf("run(%q) = %v, exit code %d; want exit code %d", args, err, code, exitLimit)
+	}
+	records := decodeLines(t, stdout.Bytes())
+	if len(records) != 1 {
+		t.Fatalf("run(%q) stdout = %v, want one error record", args, records)
+	}
+	want := map[string]any{"kind": "error", "exit": 3.0, "limit": "samples", "value": 10.0}
+	if diff := cmp.Diff(want, withoutMessage(t, records[0])); diff != "" {
+		t.Errorf("run(%q) error record (-want +got):\n%s", args, diff)
+	}
+}
+
+// withoutMessage checks that rec's message is set and returns rec without it, so the rest can be compared.
+func withoutMessage(t *testing.T, rec map[string]any) map[string]any {
+	t.Helper()
+	if msg, _ := rec["message"].(string); msg == "" {
+		t.Errorf("%v has message %v, want one", rec, rec["message"])
+	}
+	out := maps.Clone(rec)
+	delete(out, "message")
+	return out
+}
+
+// With the default limits, every command's output over a dump wider than the limits fits the sandboxed caller's
+// 1 MiB.
+func TestDefaultLimitsFitTheCap(t *testing.T) {
+	dumpDir := writeWide(t, 300)
+	commands := [][]string{
+		{"info"},
+		{"query", "instant", "--promql", fixture.WideMetric},
+		{"query", "range", "--promql", fixture.WideMetric},
+		{"query", "range", "--promql", fixture.WideMetric, "--start", "3h", "--step", "15s"},
+		{"query", "series", "--promql", fixture.WideMetric},
+		{"query", "labels"},
+		{"query", "labels", "series"},
+	}
+	for _, command := range commands {
+		t.Run(strings.Join(command, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"--dump", dumpDir, "--scratch", t.TempDir()}, command...)
+			if err := run(t.Context(), args, &stdout, &stderr); err != nil {
+				t.Fatalf("run(%q) = %v, want nil; stderr:\n%s", args, err, &stderr)
+			}
+			if stdout.Len() >= 1<<20 {
+				t.Errorf("run(%q) wrote %d bytes, want under 1 MiB", args, stdout.Len())
+			}
+		})
+	}
+}
+
+// The WAL's size is on stderr before the replay starts, so an engineer on a small host can choose --no-wal.
+func TestWALSizeBeforeReplay(t *testing.T) {
+	dumpDir := writeFixture(t, 15*time.Second)
+	var stdout, stderr bytes.Buffer
+	args := []string{"--dump", dumpDir, "--scratch", t.TempDir(), "query", "instant", "--promql", "up"}
+	if err := run(t.Context(), args, &stdout, &stderr); err != nil {
+		t.Fatalf("run(%q) = %v, want nil; stderr:\n%s", args, err, &stderr)
+	}
+	log := stderr.String()
+	const sizeAttr = `msg="replaying WAL" bytes=`
+	size := strings.Index(log, sizeAttr)
+	replayed := strings.Index(log, `msg="replayed WAL"`)
+	if size < 0 || strings.HasPrefix(log[size+len(sizeAttr):], "0") || replayed < 0 || size > replayed {
+		t.Errorf("run(%q) stderr has the WAL's size at %v and the replay's end at %d, want the size first:\n%s",
+			args, size, replayed, log)
 	}
 }

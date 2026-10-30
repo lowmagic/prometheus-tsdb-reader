@@ -389,8 +389,9 @@ replay and by `--no-wal`. The runtime's soft memory limit isn't offered: it can'
 only slow the process down near it, and a sandbox that caps memory already does so with its own cgroup. Hitting
 a limit is reported, never silent.
 
-- **LIMIT-1: Series limit.** A result has at most `--max-series` series. The default keeps the output readable
-  and, with LIMIT-2, under the sandboxed caller's cap.
+- **LIMIT-1: Series limit.** A result has at most `--max-series` series, and so does a series listing. The
+  default keeps the output readable and, with LIMIT-2, under the sandboxed caller's cap. A label listing isn't
+  cut: it is one record of names or values, not one per series.
 - **LIMIT-2: Point limit.** A range result has at most `--max-points` points across all series. The default is
   chosen so that a full result stays under 1 MiB of JSON lines, which is why the two limits interlock: at
   STEP-1's 500 points per series, the point limit holds forty series, so a day-long query over a hundred series

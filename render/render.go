@@ -122,6 +122,7 @@ func Series(w io.Writer, s Summary, l *query.Listing) error {
 		Start:       timeOf(l.Start),
 		End:         timeOf(l.End),
 		Series:      len(l.Series),
+		Truncated:   truncatedOf(l.Truncated),
 		Empty:       emptyOf(l.Empty),
 	}
 	if err := enc.Encode(summary); err != nil {
@@ -188,6 +189,12 @@ func Error(w io.Writer, exit int, message string) error {
 	return newEncoder(w).Encode(errorRecord{Kind: "error", Exit: exit, Message: message})
 }
 
+// LimitError writes the record a run a limit refused leaves as its only line on stdout, naming the limit and its
+// value.
+func LimitError(w io.Writer, exit int, message, limit string, value int) error {
+	return newEncoder(w).Encode(errorRecord{Kind: "error", Exit: exit, Message: message, Limit: limit, Value: &value})
+}
+
 func newEncoder(w io.Writer) *json.Encoder {
 	enc := json.NewEncoder(w)
 	// PromQL is full of < and >, and a reader should see them as they are.
@@ -223,20 +230,22 @@ type rangeSummary struct {
 
 // resultTail is the summary fields a query result ends with.
 type resultTail struct {
-	Series         int       `json:"series"`
-	Points         int       `json:"points"`
-	Empty          *emptyRec `json:"empty"`
-	SampleInterval *string   `json:"sample_interval"`
-	Warnings       []warning `json:"warnings"`
+	Series         int           `json:"series"`
+	Points         int           `json:"points"`
+	Truncated      *truncatedRec `json:"truncated"`
+	Empty          *emptyRec     `json:"empty"`
+	SampleInterval *string       `json:"sample_interval"`
+	Warnings       []warning     `json:"warnings"`
 }
 
 type seriesSummary struct {
 	summaryHead
-	Selectors []string  `json:"selectors"`
-	Start     timeOf    `json:"start"`
-	End       timeOf    `json:"end"`
-	Series    int       `json:"series"`
-	Empty     *emptyRec `json:"empty"`
+	Selectors []string      `json:"selectors"`
+	Start     timeOf        `json:"start"`
+	End       timeOf        `json:"end"`
+	Series    int           `json:"series"`
+	Truncated *truncatedRec `json:"truncated"`
+	Empty     *emptyRec     `json:"empty"`
 }
 
 type labelsSummary struct {
@@ -245,6 +254,12 @@ type labelsSummary struct {
 	Start     timeOf    `json:"start"`
 	End       timeOf    `json:"end"`
 	Empty     *emptyRec `json:"empty"`
+}
+
+type truncatedRec struct {
+	Limit string `json:"limit"`
+	Value int    `json:"value"`
+	Full  int    `json:"full"`
 }
 
 type emptyRec struct {
@@ -317,6 +332,8 @@ type errorRecord struct {
 	Kind    string `json:"kind"`
 	Exit    int    `json:"exit"`
 	Message string `json:"message"`
+	Limit   string `json:"limit,omitempty"`
+	Value   *int   `json:"value,omitempty"`
 }
 
 func headOf(s Summary) summaryHead {
@@ -369,12 +386,25 @@ func tailOf(r *query.Result) resultTail {
 	for _, w := range r.Warnings {
 		warnings = append(warnings, warning{Code: w.Code, Message: w.Message})
 	}
-	tail := resultTail{Series: len(r.Series), Points: r.Points(), Empty: emptyOf(r.Empty), Warnings: warnings}
+	tail := resultTail{
+		Series:    len(r.Series),
+		Points:    r.Points(),
+		Truncated: truncatedOf(r.Truncated),
+		Empty:     emptyOf(r.Empty),
+		Warnings:  warnings,
+	}
 	if r.HasSampleInterval {
 		interval := duration(r.SampleInterval)
 		tail.SampleInterval = &interval
 	}
 	return tail
+}
+
+func truncatedOf(t *query.Truncation) *truncatedRec {
+	if t == nil {
+		return nil
+	}
+	return &truncatedRec{Limit: t.Limit, Value: t.Value, Full: t.Full}
 }
 
 func emptyOf(e *query.Empty) *emptyRec {

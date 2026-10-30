@@ -122,6 +122,38 @@ func Write(ctx context.Context, dir string, interval time.Duration) (err error) 
 	return nil
 }
 
+// WideMetric is the metric Wide writes.
+const WideMetric = "wide_metric"
+
+// WideSpan is how long Wide's samples run.
+const WideSpan = 3 * time.Hour
+
+// Wide writes a TSDB into dir that holds only a WAL: n series of WideMetric, named series="s000" upwards so their
+// label order is their number, each scraped every 15s from Start for WideSpan with its number as its value, so a
+// result sorted by value isn't in label order.
+func Wide(ctx context.Context, dir string, n int) (err error) {
+	db, err := tsdb.Open(dir, nil, nil, tsdb.DefaultOptions(), nil)
+	if err != nil {
+		return fmt.Errorf("open fixture TSDB: %w", err)
+	}
+	defer func() { err = errors.Join(err, db.Close()) }()
+	db.DisableCompactions()
+
+	for t := Start(); !t.After(Start().Add(WideSpan)); t = t.Add(15 * time.Second) {
+		app := db.Appender(ctx)
+		for i := range n {
+			ls := labels.FromStrings("__name__", WideMetric, "job", "wide", "series", fmt.Sprintf("s%03d", i))
+			if _, err := app.Append(0, ls, t.UnixMilli(), float64(i)); err != nil {
+				return errors.Join(fmt.Errorf("append fixture sample: %w", err), app.Rollback())
+			}
+		}
+		if err := app.Commit(); err != nil {
+			return fmt.Errorf("commit fixture samples: %w", err)
+		}
+	}
+	return nil
+}
+
 // scraped is one series' sample at a scrape time.
 type scraped struct {
 	labels labels.Labels

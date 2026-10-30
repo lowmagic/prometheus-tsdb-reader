@@ -3,6 +3,7 @@ package query
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -60,6 +61,8 @@ type Result struct {
 	HasSampleInterval bool
 	// Empty says why the result is empty, and is nil when it isn't.
 	Empty *Empty
+	// Truncated is the limit that cut the result, and is nil when none did.
+	Truncated *Truncation
 	// Warnings are the step warnings, the sample interval's, then the engine's annotations, sorted, under the
 	// code "promql".
 	Warnings []Warning
@@ -136,13 +139,20 @@ type Bucket struct {
 type Engine struct {
 	ng     *promql.Engine
 	parser parser.Parser
+	opts   Options
 }
 
-// NewEngine returns an engine configured with Prometheus's server defaults.
-func NewEngine() *Engine {
+// NewEngine returns an engine configured with Prometheus's server defaults, which cuts no result.
+func NewEngine() *Engine { return NewEngineWithOptions(Options{}) }
+
+// NewEngineWithOptions returns an engine configured with Prometheus's server defaults and opts's limits.
+func NewEngineWithOptions(opts Options) *Engine {
+	if opts.MaxSamples <= 0 {
+		opts.MaxSamples = defaultMaxSamples
+	}
 	p := parser.NewParser(parser.Options{ExperimentalDurationExpr: true})
-	return &Engine{parser: p, ng: promql.NewEngine(promql.EngineOpts{
-		MaxSamples:    defaultMaxSamples,
+	return &Engine{parser: p, opts: opts, ng: promql.NewEngine(promql.EngineOpts{
+		MaxSamples:    opts.MaxSamples,
 		Timeout:       noTimeout,
 		LookbackDelta: lookbackDelta,
 		NoStepSubqueryIntervalFn: func(int64) int64 {
@@ -162,11 +172,12 @@ func (e *Engine) Instant(ctx context.Context, d Dump, expr string, at Time) (*Re
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", expr, err)
 	}
-	res, err := execute(ctx, d, qry, expr)
+	res, err := e.execute(ctx, d, qry, expr)
 	if err != nil {
 		return nil, err
 	}
 	res.Time = t
+	e.truncate(res)
 	return res, nil
 }
 
@@ -191,18 +202,19 @@ func (e *Engine) Range(ctx context.Context, d Dump, expr string, span Span) (*Re
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", expr, err)
 	}
-	res, err := execute(ctx, d, qry, expr)
+	res, err := e.execute(ctx, d, qry, expr)
 	if err != nil {
 		return nil, err
 	}
 	res.Start, res.End, res.Step = start, end, step
 	res.Warnings = append(stepWarnings(step, res.SampleInterval, res.HasSampleInterval), res.Warnings...)
+	e.truncate(res)
 	return res, nil
 }
 
 // execute runs a prepared query, then reads its selectors once more for the sample interval and, when the
 // result is empty, the reason.
-func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Result, error) {
+func (e *Engine) execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Result, error) {
 	defer qry.Close()
 	// The engine rewrites the statement as it evaluates, as when it replaces a subquery with the series it
 	// computed, so the selectors and their windows are read before it runs.
@@ -214,6 +226,9 @@ func execute(ctx context.Context, d Dump, qry promql.Query, expr string) (*Resul
 	start, end := stmt.Start.UnixMilli(), stmt.End.UnixMilli()
 
 	res := qry.Exec(ctx)
+	if tooMany := promql.ErrTooManySamples(""); errors.As(res.Err, &tooMany) {
+		return nil, &LimitError{Limit: LimitSamples, Value: e.opts.MaxSamples, Err: res.Err}
+	}
 	if res.Err != nil {
 		return nil, fmt.Errorf("evaluate %q: %w", expr, res.Err)
 	}

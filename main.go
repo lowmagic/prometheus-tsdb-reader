@@ -27,6 +27,7 @@ import (
 const (
 	exitFailed  = 1
 	exitBadArgs = 2
+	exitLimit   = 3
 )
 
 func main() {
@@ -40,12 +41,21 @@ func main() {
 	stop()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		var usage *usageError
-		if errors.As(err, &usage) {
-			os.Exit(exitBadArgs)
-		}
-		os.Exit(exitFailed)
+		os.Exit(exitCode(err))
 	}
+}
+
+// exitCode is RUN-3's exit code for a run that returned err.
+func exitCode(err error) int {
+	var usage *usageError
+	var limit *query.LimitError
+	switch {
+	case errors.As(err, &usage):
+		return exitBadArgs
+	case errors.As(err, &limit):
+		return exitLimit
+	}
+	return exitFailed
 }
 
 // usageError is a run refused for its arguments, before anything was read.
@@ -66,10 +76,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	written := &countingWriter{w: stdout}
 	out := bufio.NewWriter(written)
 	err := execute(ctx, args, out, stderr)
-	var usage *usageError
-	if err != nil && !errors.As(err, &usage) && written.n == 0 {
+	if code := exitCode(err); err != nil && code != exitBadArgs && written.n == 0 {
 		out.Reset(written)
-		err = errors.Join(err, render.Error(out, exitFailed, err.Error()))
+		var limit *query.LimitError
+		if errors.As(err, &limit) {
+			err = errors.Join(err, render.LimitError(out, code, err.Error(), limit.Limit, limit.Value))
+		} else {
+			err = errors.Join(err, render.Error(out, code, err.Error()))
+		}
 	}
 	return errors.Join(err, out.Flush())
 }
@@ -86,8 +100,14 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// defaultMaxExtractBytes is the spec's default for --max-extract-bytes: 32 GiB.
-const defaultMaxExtractBytes = 32 << 30
+// The spec's defaults for the limit flags. --max-extract-bytes is 32 GiB; the series and point limits keep a
+// result under the sandboxed caller's 1 MiB.
+const (
+	defaultMaxExtractBytes = 32 << 30
+	defaultMaxSeries       = 100
+	defaultMaxPoints       = 20_000
+	defaultMaxSamples      = 50_000_000
+)
 
 const usage = `usage: prometheus-tsdb-reader --dump PATH [global flags] COMMAND [command flags]
 
@@ -110,6 +130,7 @@ type config struct {
 	dump     string
 	dumpOpts dump.Options
 	noWAL    bool
+	limits   query.Options
 	logger   *slog.Logger
 }
 
@@ -129,6 +150,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		"leave the WAL out: don't replay it, and end the dump with its newest block")
 	global.Int64Var(&cfg.dumpOpts.MaxExtractBytes, "max-extract-bytes", defaultMaxExtractBytes,
 		"the most `bytes` extracting an archive may write")
+	global.IntVar(&cfg.limits.MaxSeries, "max-series", defaultMaxSeries, "the most `series` a result keeps")
+	global.IntVar(&cfg.limits.MaxPoints, "max-points", defaultMaxPoints,
+		"the most `points` a range result keeps, across all its series")
+	global.IntVar(&cfg.limits.MaxSamples, "max-samples", defaultMaxSamples,
+		"the most `samples` one query may load, as Prometheus's --query.max-samples")
 	if err := checkSpelling(args); err != nil {
 		return err
 	}
@@ -141,6 +167,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	if cfg.dumpOpts.MaxExtractBytes <= 0 {
 		return usagef("--max-extract-bytes must be positive, not %d", cfg.dumpOpts.MaxExtractBytes)
+	}
+	for _, l := range []struct {
+		name string
+		v    int
+	}{{"max-series", cfg.limits.MaxSeries}, {"max-points", cfg.limits.MaxPoints}, {"max-samples", cfg.limits.MaxSamples}} {
+		if l.v <= 0 {
+			return usagef("--%s must be positive, not %d", l.name, l.v)
+		}
 	}
 	cfg.logger = slog.New(slog.NewTextHandler(stderr, nil))
 
@@ -206,7 +240,7 @@ func queryInstant(ctx context.Context, cfg config, args []string, stdout, stderr
 	if err != nil {
 		return err
 	}
-	res, err := query.NewEngine().Instant(ctx, o.queryDump(), *expr, *at)
+	res, err := query.NewEngineWithOptions(cfg.limits).Instant(ctx, o.queryDump(), *expr, *at)
 	if err := o.close(err); err != nil {
 		return err
 	}
@@ -239,7 +273,7 @@ func queryRange(ctx context.Context, cfg config, args []string, stdout, stderr i
 	if err != nil {
 		return err
 	}
-	res, err := query.NewEngine().Range(ctx, o.queryDump(), *expr, span)
+	res, err := query.NewEngineWithOptions(cfg.limits).Range(ctx, o.queryDump(), *expr, span)
 	if err := o.close(err); err != nil {
 		return err
 	}
@@ -262,7 +296,7 @@ func querySeries(ctx context.Context, cfg config, args []string, stdout, stderr 
 	if err != nil {
 		return err
 	}
-	l, err := query.NewEngine().Series(ctx, o.queryDump(), *selectors, *start, *end)
+	l, err := query.NewEngineWithOptions(cfg.limits).Series(ctx, o.queryDump(), *selectors, *start, *end)
 	if err := o.close(err); err != nil {
 		return err
 	}
@@ -287,7 +321,7 @@ func queryLabels(ctx context.Context, cfg config, args []string, stdout, stderr 
 	if err != nil {
 		return err
 	}
-	l, err := query.NewEngine().Labels(ctx, o.queryDump(), name, *selectors, *start, *end)
+	l, err := query.NewEngineWithOptions(cfg.limits).Labels(ctx, o.queryDump(), name, *selectors, *start, *end)
 	if err := o.close(err); err != nil {
 		return err
 	}
