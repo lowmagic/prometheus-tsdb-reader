@@ -302,6 +302,18 @@ interfaces, and a reader who wants a node total sums the result, since a sum ove
 by `namespace` and `pod`, and a pod that has a `used` series but no `limit` series is listed by name in the
 summary, so a pod with no limit is reported rather than dropped by a division that finds nothing to divide by.
 
+A named query's summary has `expressions` in place of `expression`: each with its `name`, the `promql` that ran
+and its own `empty` reason or null, so an expression that found nothing is never just absent. The top-level
+`empty` is set only when every expression is empty, and is the first one's. `series` and `points` count all
+the expressions' records, and each record names its `expression`. The limits are shared: each expression keeps
+at most an even share of `--max-series` and `--max-points`, so a cut never drops one side and the whole output
+still fits; `truncated` names the first limit that cut, the flag's value, and the series or points all the
+expressions had in full. `unpaired` is computed before the cut, so a pod whose limit series was cut isn't
+reported as having none. `sample_interval` is the finest of the expressions', and with more than one
+expression each warning's message starts with the expression's name. A single expression is named for what it
+measures: `busy` for `node-cpu`, `iowait`, `load1` to `load1_per_cpu`, `used` and `available` for `node-memory`,
+`receive` and `transmit`, and `write_latency`.
+
 Two of these correct the working notes they come from, and one fixes them. `node-cpu` and `node-iowait` are
 already per-CPU averages, so dividing by the CPU count again is wrong. `node-disk-write-latency` must use the
 same matchers on both sides; with different instances on each side the division matches nothing.

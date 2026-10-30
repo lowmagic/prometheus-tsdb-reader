@@ -113,6 +113,81 @@ func Range(w io.Writer, s Summary, expr string, r *query.Result) error {
 	return writeResult(enc, r)
 }
 
+// NamedExpression is one of a named query's expressions as it ran, and its result.
+type NamedExpression struct {
+	Name, PromQL string
+	Result       *query.Result
+}
+
+// NamedResult is a named query's results, in its expressions' order. Truncated is the limit that cut them, or
+// nil. Unpaired is set only for a query that compares two expressions, when Compare.
+type NamedResult struct {
+	Expressions []NamedExpression
+	Truncated   *query.Truncation
+	Compare     bool
+	Unpaired    [][]query.Label
+}
+
+// Named writes a named query's summary, then each expression's records in turn, each naming its expression.
+func Named(w io.Writer, s Summary, n NamedResult) error {
+	enc := newEncoder(w)
+	first := n.Expressions[0].Result
+	summary := namedSummary{
+		summaryHead: headOf(s),
+		Start:       timeOf(first.Start),
+		End:         timeOf(first.End),
+		Step:        duration(first.Step),
+		Truncated:   truncatedOf(n.Truncated),
+		Warnings:    []warning{},
+	}
+	var interval time.Duration
+	for _, e := range n.Expressions {
+		r := e.Result
+		summary.Expressions = append(summary.Expressions, namedExpression{Name: e.Name, PromQL: e.PromQL, Empty: emptyOf(r.Empty)})
+		summary.Series += len(r.Series)
+		summary.Points += r.Points()
+		if r.HasSampleInterval && (interval == 0 || r.SampleInterval < interval) {
+			interval = r.SampleInterval
+		}
+		for _, w := range r.Warnings {
+			msg := w.Message
+			if len(n.Expressions) > 1 {
+				msg = e.Name + ": " + msg
+			}
+			summary.Warnings = append(summary.Warnings, warning{Code: w.Code, Message: msg})
+		}
+	}
+	if summary.Series == 0 {
+		summary.Empty = emptyOf(first.Empty)
+	}
+	if interval > 0 {
+		d := duration(interval)
+		summary.SampleInterval = &d
+	}
+	if n.Compare {
+		unpaired := make([]map[string]string, 0, len(n.Unpaired))
+		for _, ls := range n.Unpaired {
+			unpaired = append(unpaired, metricOf(ls))
+		}
+		summary.Unpaired = &unpaired
+	}
+	if err := enc.Encode(summary); err != nil {
+		return err
+	}
+	for _, e := range n.Expressions {
+		for _, series := range e.Result.Series {
+			rec := seriesRecord{Kind: "series", Expression: e.Name, Metric: metricOf(series.Labels)}
+			for _, p := range series.Points {
+				rec.Values = append(rec.Values, samplePair(p))
+			}
+			if err := enc.Encode(rec); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // Series writes a series listing's summary, then one record per series.
 func Series(w io.Writer, s Summary, l *query.Listing) error {
 	enc := newEncoder(w)
@@ -238,6 +313,28 @@ type resultTail struct {
 	Warnings       []warning     `json:"warnings"`
 }
 
+type namedSummary struct {
+	summaryHead
+	Expressions    []namedExpression    `json:"expressions"`
+	Start          timeOf               `json:"start"`
+	End            timeOf               `json:"end"`
+	Step           string               `json:"step"`
+	Series         int                  `json:"series"`
+	Points         int                  `json:"points"`
+	Truncated      *truncatedRec        `json:"truncated"`
+	Empty          *emptyRec            `json:"empty"`
+	Unpaired       *[]map[string]string `json:"unpaired,omitempty"`
+	SampleInterval *string              `json:"sample_interval"`
+	Warnings       []warning            `json:"warnings"`
+}
+
+// namedExpression is one expression of a named query as it ran, and why its result is empty when it is.
+type namedExpression struct {
+	Name   string    `json:"name"`
+	PromQL string    `json:"promql"`
+	Empty  *emptyRec `json:"empty"`
+}
+
 type seriesSummary struct {
 	summaryHead
 	Selectors []string      `json:"selectors"`
@@ -317,10 +414,12 @@ type warning struct {
 }
 
 type seriesRecord struct {
-	Kind   string            `json:"kind"`
-	Metric map[string]string `json:"metric"`
-	Value  *pair             `json:"value,omitempty"`
-	Values []pair            `json:"values,omitempty"`
+	Kind string `json:"kind"`
+	// Expression names a named query's expression the series came from.
+	Expression string            `json:"expression,omitempty"`
+	Metric     map[string]string `json:"metric"`
+	Value      *pair             `json:"value,omitempty"`
+	Values     []pair            `json:"values,omitempty"`
 }
 
 type valueRecord struct {

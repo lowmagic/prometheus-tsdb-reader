@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/junglestyle/prometheus-tsdb-reader/dump"
+	"github.com/junglestyle/prometheus-tsdb-reader/named"
 	"github.com/junglestyle/prometheus-tsdb-reader/query"
 	"github.com/junglestyle/prometheus-tsdb-reader/render"
 	"github.com/junglestyle/prometheus-tsdb-reader/store"
@@ -120,6 +121,9 @@ commands:
                                           the series matching any of the selectors
   query labels [NAME] [--promql SELECTOR...] [--start T] [--end T]
                                           label names, or the values of NAME
+  named NAME [query flags] [--start T] [--end T] [--step D] [--window D]
+                                          a named query built from typed flags, over a range;
+                                          named NAME --help lists its flags
 
 T is an RFC 3339 time or a duration such as 6h back from the dump's end.
 
@@ -130,6 +134,7 @@ type config struct {
 	dump     string
 	dumpOpts dump.Options
 	noWAL    bool
+	queries  string
 	limits   query.Options
 	logger   *slog.Logger
 }
@@ -150,6 +155,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		"leave the WAL out: don't replay it, and end the dump with its newest block")
 	global.Int64Var(&cfg.dumpOpts.MaxExtractBytes, "max-extract-bytes", defaultMaxExtractBytes,
 		"the most `bytes` extracting an archive may write")
+	global.StringVar(&cfg.queries, "queries", "", "a named-query `file` in place of the embedded one")
 	global.IntVar(&cfg.limits.MaxSeries, "max-series", defaultMaxSeries, "the most `series` a result keeps")
 	global.IntVar(&cfg.limits.MaxPoints, "max-points", defaultMaxPoints,
 		"the most `points` a range result keeps, across all its series")
@@ -185,6 +191,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		"query range":   queryRange,
 		"query series":  querySeries,
 		"query labels":  queryLabels,
+		"named":         namedQuery,
 	}
 	for words := 1; words <= 2 && words <= len(rest); words++ {
 		if command, ok := commands[strings.Join(rest[:words], " ")]; ok {
@@ -250,18 +257,7 @@ func queryInstant(ctx context.Context, cfg config, args []string, stdout, stderr
 func queryRange(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("query range", stderr)
 	expr := fs.String("promql", "", "the PromQL `expression` to evaluate")
-	var span query.Span
-	timeVar(fs, &span.Start, "start", "range start (default 2h before the end)")
-	timeVar(fs, &span.End, "end", "range end (default the dump's end)")
-	fs.Func("step", "the `duration` between points, such as 1m (default from the range: the smallest of 1m, 5m, 15m, 1h "+
-		"and 6h that gives at most 500 points)", func(s string) error {
-		d, err := model.ParseDuration(s)
-		if err != nil || d <= 0 {
-			return fmt.Errorf("step %q is not a positive duration", s)
-		}
-		span.Step = time.Duration(d)
-		return nil
-	})
+	span := spanFlags(fs)
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -273,7 +269,7 @@ func queryRange(ctx context.Context, cfg config, args []string, stdout, stderr i
 	if err != nil {
 		return err
 	}
-	res, err := query.NewEngineWithOptions(cfg.limits).Range(ctx, o.queryDump(), *expr, span)
+	res, err := query.NewEngineWithOptions(cfg.limits).Range(ctx, o.queryDump(), *expr, *span)
 	if err := o.close(err); err != nil {
 		return err
 	}
@@ -328,6 +324,111 @@ func queryLabels(ctx context.Context, cfg config, args []string, stdout, stderr 
 	return render.Labels(stdout, o.summary("query labels", o.gaps(l.Start, l.End)), l)
 }
 
+// defaultWindow is the spec's default for --window, the range in a named query's rate.
+const defaultWindow = 5 * time.Minute
+
+func namedQuery(ctx context.Context, cfg config, args []string, stdout, stderr io.Writer) error {
+	file, err := cfg.queryFile()
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return usagef("named needs a query name, one of %s", strings.Join(file.Names(), ", "))
+	}
+	q, ok := file.Query(args[0])
+	if !ok {
+		return usagef("no named query %q: the queries are %s", args[0], strings.Join(file.Names(), ", "))
+	}
+
+	fs := newFlagSet("named "+q.Name, stderr)
+	span := spanFlags(fs)
+	window := defaultWindow
+	fs.Func("window", "the `duration` of the range in the query's rate (default 5m)", func(s string) error {
+		d, err := model.ParseDuration(s)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("window %q is not a positive duration", s)
+		}
+		window = time.Duration(d)
+		return nil
+	})
+	values := map[string]string{}
+	for _, f := range file.FlagsOf(q) {
+		if fs.Lookup(f.Name) != nil {
+			return fmt.Errorf("the query file's flag %q is taken by the command's own", f.Name)
+		}
+		usage := "matches the `value` of the label " + f.Label + " exactly"
+		if f.Match == named.MatchRegex {
+			usage = "matches the label " + f.Label + " against a `regex`, anchored at both ends"
+		}
+		fs.Func(f.Name, usage, func(s string) error {
+			values[f.Name] = s
+			return nil
+		})
+	}
+	if err := parseFlags(fs, args[1:]); err != nil {
+		return err
+	}
+	built, err := file.Build(q, values, window)
+	if err != nil {
+		return usagef("%v", err)
+	}
+
+	o, err := cfg.open(ctx, true)
+	if err != nil {
+		return err
+	}
+	exprs := make([]string, 0, len(built))
+	for _, b := range built {
+		exprs = append(exprs, b.PromQL)
+	}
+	engine := query.NewEngineWithOptions(cfg.limits)
+	results, err := engine.Ranges(ctx, o.queryDump(), exprs, *span)
+	if err := o.close(err); err != nil {
+		return err
+	}
+
+	res := render.NamedResult{Compare: q.Compare != nil}
+	readStart, readEnd := results[0].ReadStart, results[0].ReadEnd
+	byName := map[string]*query.Result{}
+	for i, b := range built {
+		res.Expressions = append(res.Expressions, render.NamedExpression{Name: b.Name, PromQL: b.PromQL, Result: results[i]})
+		byName[b.Name] = results[i]
+		readStart, readEnd = minTime(readStart, results[i].ReadStart), maxTime(readEnd, results[i].ReadEnd)
+	}
+	// Paired before the cut, so a series the cut dropped from the right isn't reported missing.
+	if c := q.Compare; c != nil {
+		res.Unpaired = named.Unpaired(c, byName[c.Left].Series, byName[c.Right].Series)
+	}
+	res.Truncated = engine.Share(results)
+	return render.Named(stdout, o.summary("named "+q.Name, o.gaps(readStart, readEnd)), res)
+}
+
+// queryFile reads the named-query file --queries names, or the embedded one.
+func (c config) queryFile() (*named.File, error) {
+	data := named.Shipped()
+	if c.queries != "" {
+		var err error
+		if data, err = os.ReadFile(c.queries); err != nil {
+			return nil, err
+		}
+	}
+	return named.Parse(data)
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
 // deniable reports whether a caller may deny a flag by refusing one argument, so it is accepted in only one
 // spelling.
 func deniable(name string) bool { return name == "promql" }
@@ -369,6 +470,23 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 		return usagef("unexpected argument %q: an expression or selector enters only through --promql", fs.Arg(0))
 	}
 	return nil
+}
+
+// spanFlags defines a range's --start, --end and --step.
+func spanFlags(fs *flag.FlagSet) *query.Span {
+	var span query.Span
+	timeVar(fs, &span.Start, "start", "range start (default 2h before the end)")
+	timeVar(fs, &span.End, "end", "range end (default the dump's end)")
+	fs.Func("step", "the `duration` between points, such as 1m (default from the range: the smallest of 1m, 5m, 15m, 1h "+
+		"and 6h that gives at most 500 points)", func(s string) error {
+		d, err := model.ParseDuration(s)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("step %q is not a positive duration", s)
+		}
+		span.Step = time.Duration(d)
+		return nil
+	})
+	return &span
 }
 
 func timeFlag(fs *flag.FlagSet, name, usage string) *query.Time {

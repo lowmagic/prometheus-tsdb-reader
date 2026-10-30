@@ -1,0 +1,76 @@
+{
+  "flags": [
+    {"name": "namespace", "label": "namespace", "match": "exact"},
+    {"name": "pod", "label": "pod", "match": "regex"},
+    {"name": "instance", "label": "instance", "match": "exact"},
+    {"name": "device", "label": "device", "match": "regex"},
+    {"name": "mount", "label": "mount_point", "match": "regex"}
+  ],
+  "queries": [
+    {
+      "name": "pod-cpu",
+      "flags": ["namespace", "pod"],
+      "expressions": [
+        {"name": "used", "promql": "sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{container!='', container!='POD'}[5m]))"},
+        {"name": "limit", "promql": "sum by (namespace, pod) (kube_pod_container_resource_limits{resource='cpu'})"}
+      ],
+      "compare": {"left": "used", "right": "limit", "on": ["namespace", "pod"]}
+    },
+    {
+      "name": "pod-memory",
+      "flags": ["namespace", "pod"],
+      "expressions": [
+        {"name": "used", "promql": "sum by (namespace, pod) (container_memory_working_set_bytes{container!='', container!='POD'})"},
+        {"name": "limit", "promql": "sum by (namespace, pod) (kube_pod_container_resource_limits{resource='memory'})"}
+      ],
+      "compare": {"left": "used", "right": "limit", "on": ["namespace", "pod"]}
+    },
+    {
+      "name": "node-cpu",
+      "flags": ["instance"],
+      "expressions": [
+        {"name": "busy", "promql": "1 - avg by (instance) (rate(node_cpu_seconds_total{mode='idle'}[5m]))"}
+      ]
+    },
+    {
+      "name": "node-iowait",
+      "flags": ["instance"],
+      "expressions": [
+        {"name": "iowait", "promql": "avg by (instance) (rate(node_cpu_seconds_total{mode='iowait'}[5m]))"}
+      ]
+    },
+    {
+      "name": "node-load",
+      "flags": ["instance"],
+      "expressions": [
+        {"name": "load1", "promql": "node_load1"},
+        {"name": "load5", "promql": "node_load5"},
+        {"name": "load15", "promql": "node_load15"},
+        {"name": "load1_per_cpu", "promql": "instance:node_load1_per_cpu:ratio"}
+      ]
+    },
+    {
+      "name": "node-memory",
+      "flags": ["instance"],
+      "expressions": [
+        {"name": "used", "promql": "1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes"},
+        {"name": "available", "promql": "node_memory_MemAvailable_bytes"}
+      ]
+    },
+    {
+      "name": "node-network",
+      "flags": ["instance", "device"],
+      "expressions": [
+        {"name": "receive", "promql": "sum by (instance, device) (rate(node_network_receive_bytes_total[5m]))"},
+        {"name": "transmit", "promql": "sum by (instance, device) (rate(node_network_transmit_bytes_total[5m]))"}
+      ]
+    },
+    {
+      "name": "node-disk-write-latency",
+      "flags": ["instance", "device"],
+      "expressions": [
+        {"name": "write_latency", "promql": "rate(node_disk_write_time_seconds_total[5m]) / rate(node_disk_writes_completed_total[5m])"}
+      ]
+    }
+  ]
+}

@@ -44,22 +44,22 @@ func (e *LimitError) Error() string {
 
 func (e *LimitError) Unwrap() error { return e.Err }
 
-// truncate cuts a vector or matrix result to the engine's limits, keeping whole series, the first in label order.
-func (e *Engine) truncate(r *Result) {
+// truncate cuts a vector or matrix result to opts's limits, keeping whole series, the first in label order.
+func truncate(r *Result, opts Options) {
 	if r.Type != Vector && r.Type != Matrix {
 		return
 	}
 	keep := len(r.Series)
 	limit, full := "", 0
-	if e.opts.MaxSeries > 0 && keep > e.opts.MaxSeries {
-		keep, limit, full = e.opts.MaxSeries, LimitSeries, len(r.Series)
+	if opts.MaxSeries > 0 && keep > opts.MaxSeries {
+		keep, limit, full = opts.MaxSeries, LimitSeries, len(r.Series)
 	}
 	// An instant result counts one point per series, so the point limit bounds only a range result.
-	if r.Type == Matrix && e.opts.MaxPoints > 0 && r.Points() > e.opts.MaxPoints {
+	if r.Type == Matrix && opts.MaxPoints > 0 && r.Points() > opts.MaxPoints {
 		points := 0
 		for i, s := range r.Series[:keep] {
 			points += len(s.Points)
-			if points > e.opts.MaxPoints {
+			if points > opts.MaxPoints {
 				keep, limit, full = i, LimitPoints, r.Points()
 				break
 			}
@@ -74,9 +74,9 @@ func (e *Engine) truncate(r *Result) {
 		slices.SortStableFunc(r.Series, func(a, b Series) int { return compareLabels(a.Labels, b.Labels) })
 	}
 	r.Series = r.Series[:keep]
-	value := e.opts.MaxSeries
+	value := opts.MaxSeries
 	if limit == LimitPoints {
-		value = e.opts.MaxPoints
+		value = opts.MaxPoints
 	}
 	r.Truncated = &Truncation{Limit: limit, Value: value, Full: full}
 }

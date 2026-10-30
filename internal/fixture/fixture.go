@@ -154,6 +154,84 @@ func Wide(ctx context.Context, dir string, n int) (err error) {
 	return nil
 }
 
+// OddNamespace is a namespace with a quote and a backslash in it, which a matcher has to escape.
+const OddNamespace = `we"ird\ns`
+
+// Pods are the pods Named writes as namespace/pod pairs. NoLimitPod has usage series and no limit series.
+var Pods = [][2]string{{"shop", "cart-1"}, {"shop", "checkout-1"}, {"shop", NoLimitPod}, {OddNamespace, "odd-1"}}
+
+// NoLimitPod is the pod in the shop namespace that has no limit series.
+const NoLimitPod = "checkout-2"
+
+// Nodes are the node-exporter instances Named writes.
+var Nodes = []string{"node-1.example.com", "node-2.example.com"}
+
+// Named writes a TSDB into dir that holds only a WAL, with the series the named queries read: cAdvisor and
+// kube-state-metrics series for Pods, and node-exporter series for Nodes, each scraped every 15s from Start for
+// WideSpan. Counters rise by a fixed amount per scrape.
+func Named(ctx context.Context, dir string) (err error) {
+	db, err := tsdb.Open(dir, nil, nil, tsdb.DefaultOptions(), nil)
+	if err != nil {
+		return fmt.Errorf("open fixture TSDB: %w", err)
+	}
+	defer func() { err = errors.Join(err, db.Close()) }()
+	db.DisableCompactions()
+
+	type series struct {
+		labels labels.Labels
+		value  float64 // The gauge's value, or what the counter adds per scrape.
+		rising bool
+	}
+	var all []series
+	add := func(v float64, rising bool, ls ...string) {
+		all = append(all, series{labels.FromStrings(ls...), v, rising})
+	}
+	for _, p := range Pods {
+		ns, pod := p[0], p[1]
+		for _, container := range []string{"app", "POD"} {
+			add(7.5, true, "__name__", "container_cpu_usage_seconds_total", "namespace", ns, "pod", pod, "container", container)
+			add(1e8, false, "__name__", "container_memory_working_set_bytes", "namespace", ns, "pod", pod, "container", container)
+		}
+		if pod != NoLimitPod {
+			add(1, false, "__name__", "kube_pod_container_resource_limits", "namespace", ns, "pod", pod, "container", "app", "resource", "cpu")
+			add(2e8, false, "__name__", "kube_pod_container_resource_limits", "namespace", ns, "pod", pod, "container", "app", "resource", "memory")
+		}
+	}
+	for _, instance := range Nodes {
+		for _, mode := range []string{"idle", "iowait", "user"} {
+			add(5, true, "__name__", "node_cpu_seconds_total", "instance", instance, "cpu", "0", "mode", mode)
+		}
+		for _, name := range []string{"node_load1", "node_load5", "node_load15", "instance:node_load1_per_cpu:ratio"} {
+			add(0.5, false, "__name__", name, "instance", instance)
+		}
+		add(4e9, false, "__name__", "node_memory_MemAvailable_bytes", "instance", instance)
+		add(16e9, false, "__name__", "node_memory_MemTotal_bytes", "instance", instance)
+		for _, device := range []string{"eth0", "lo"} {
+			add(1500, true, "__name__", "node_network_receive_bytes_total", "instance", instance, "device", device)
+			add(1500, true, "__name__", "node_network_transmit_bytes_total", "instance", instance, "device", device)
+		}
+		add(0.3, true, "__name__", "node_disk_write_time_seconds_total", "instance", instance, "device", "sda")
+		add(100, true, "__name__", "node_disk_writes_completed_total", "instance", instance, "device", "sda")
+	}
+
+	for i, t := 0, Start(); !t.After(Start().Add(WideSpan)); i, t = i+1, t.Add(15*time.Second) {
+		app := db.Appender(ctx)
+		for _, s := range all {
+			v := s.value
+			if s.rising {
+				v *= float64(i)
+			}
+			if _, err := app.Append(0, s.labels, t.UnixMilli(), v); err != nil {
+				return errors.Join(fmt.Errorf("append fixture sample: %w", err), app.Rollback())
+			}
+		}
+		if err := app.Commit(); err != nil {
+			return fmt.Errorf("commit fixture samples: %w", err)
+		}
+	}
+	return nil
+}
+
 // scraped is one series' sample at a scrape time.
 type scraped struct {
 	labels labels.Labels
