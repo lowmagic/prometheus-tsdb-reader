@@ -71,6 +71,28 @@
       "expressions": [
         {"name": "write_latency", "promql": "rate(node_disk_write_time_seconds_total[5m]) / rate(node_disk_writes_completed_total[5m])"}
       ]
+    },
+    {
+      "name": "node-rules",
+      "flags": ["instance", "device"],
+      "expressions": [
+        {"name": "cpu_utilisation", "promql": "instance:node_cpu_utilisation:rate1m", "flags": ["instance"]},
+        {"name": "memory_utilisation", "promql": "instance:node_memory_utilisation:ratio", "flags": ["instance"]},
+        {"name": "network_receive_bytes", "promql": "instance:node_network_receive_bytes_excluding_lo:rate1m", "flags": ["instance"]},
+        {"name": "network_transmit_bytes", "promql": "instance:node_network_transmit_bytes_excluding_lo:rate1m", "flags": ["instance"]},
+        {"name": "network_receive_drop", "promql": "instance:node_network_receive_drop_excluding_lo:rate1m", "flags": ["instance"]},
+        {"name": "network_transmit_drop", "promql": "instance:node_network_transmit_drop_excluding_lo:rate1m", "flags": ["instance"]},
+        {"name": "disk_io_time", "promql": "instance_device:node_disk_io_time_seconds:rate1m"},
+        {"name": "disk_io_time_weighted", "promql": "instance_device:node_disk_io_time_weighted_seconds:rate1m"}
+      ]
+    },
+    {
+      "name": "vm-filesystem",
+      "flags": ["namespace", "mount"],
+      "expressions": [
+        {"name": "used", "promql": "sum by (namespace, name, mount_point) (kubevirt_vmi_filesystem_used_bytes) / sum by (namespace, name, mount_point) (kubevirt_vmi_filesystem_capacity_bytes)"},
+        {"name": "free", "promql": "1 - sum by (namespace, name, mount_point) (kubevirt_vmi_filesystem_used_bytes) / sum by (namespace, name, mount_point) (kubevirt_vmi_filesystem_capacity_bytes)"}
+      ]
     }
   ]
 }

@@ -143,3 +143,17 @@ Delivers: the parts of the [fixtures](SPEC.md#fixtures) section that synthetic f
 
 Done when: every named query has been run on a real dump and either matched series or had its expression
 corrected in the spec and the code, and DUMP-3's layouts include every layout seen.
+
+To run it, outside the repo and with the dump on the engineer's machine:
+
+1. `info` on the archive, and note the root it chose and the WAL's size. A layout DUMP-3 doesn't find is a
+   change to DUMP-3.
+2. Each `named` query with no flags, then with one `--namespace` or `--instance` from the dump. For an
+   expression whose summary `empty` is `no-matching-series`, run `query series --promql` on each metric name it
+   uses and `query labels NAME --promql METRIC` on each label it matches on, to find the real name.
+3. `vm-filesystem` on a dump from a cluster running KubeVirt, and `query metadata` on one, if any, written with
+   metadata WAL records on.
+4. Each command with the default limits, and note the bytes written and the run's peak memory against the
+   WAL's size; tune the defaults if a result passes 1 MiB.
+5. Record what changed, or that nothing did, in one commit to the spec, `named/queries.json` and the tests. No
+   label set, sample or host name from the dump goes in it.

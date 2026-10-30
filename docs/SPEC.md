@@ -200,8 +200,10 @@ from what is readable and says what it left out.
 - **QUERY-5: Metadata listing.** `query metadata` lists metric type, help and unit. Metadata isn't part of a
   block; Prometheus writes it to the WAL only under its `metadata-wal-records` feature flag, which OpenShift's
   monitoring operator doesn't enable, so an OpenShift dump carries none. The tool reads what there is by
-  decoding the WAL's series and metadata records, since the replayed head doesn't expose them. The result says
-  when the dump has no metadata at all, which is a different answer from a metric having none.
+  decoding the WAL's series and metadata records, since the replayed head doesn't expose them; for each metric
+  it reports the newest metadata record any of its series has. It doesn't replay the WAL. The result says
+  when the dump has no metadata at all, which is a different answer from a metric having none: the summary's
+  `empty` is `no-metadata` with no selectors, or `no-metadata-for-metric` naming the `--metric` asked for.
 - **QUERY-6: Free-form PromQL sits behind one flag.** The only way an expression or selector string enters the
   tool through argv is `--promql`, written as that argument followed by the expression as the next one. The other
   spellings Go's flag package reads (`-promql X`, `--promql=X`, `-promql=X`) are bad arguments (exit 2), so a
@@ -312,7 +314,11 @@ expressions had in full. `unpaired` is computed before the cut, so a pod whose l
 reported as having none. `sample_interval` is the finest of the expressions', and with more than one
 expression each warning's message starts with the expression's name. A single expression is named for what it
 measures: `busy` for `node-cpu`, `iowait`, `load1` to `load1_per_cpu`, `used` and `available` for `node-memory`,
-`receive` and `transmit`, and `write_latency`.
+`receive` and `transmit`, and `write_latency`; `node-rules` names each rule for what follows `node_` in it, as
+`cpu_utilisation` and `disk_io_time_weighted`.
+
+`vm-filesystem` aggregates each side of its division `by (namespace, name, mount_point)` before dividing, so
+the two metrics pair on those labels whatever else they carry.
 
 Two of these correct the working notes they come from, and one fixes them. `node-cpu` and `node-iowait` are
 already per-CPU averages, so dividing by the CPU count again is wrong. `node-disk-write-latency` must use the
@@ -335,6 +341,7 @@ same matchers on both sides; with different instances on each side the division 
   | `gaps` | one entry per corrupt block the query overlaps, with `block`, `start` and `end` (both null when the block's `meta.json` doesn't read) and `error` ([DAMAGE-1](#damage)); every corrupt block for `info` |
   | `expression` or `expressions` | the expression as evaluated, or for `named` an array of `name` and `promql` |
   | `selectors` | for `query series` and `query labels`, the selectors as given, in place of an expression |
+  | `metric` | for `query metadata`, the metric it was narrowed to, or null |
   | `time`, or `start`, `end` and `step` | the evaluation time or range, and the step that was used |
   | `series`, `points` | the counts in the result; a series listing has `series` only, a label listing neither |
   | `truncated` | null, or `limit` (`series` or `points`), `value` and `full` ([LIMIT-3](#limits)) |

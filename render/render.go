@@ -211,6 +211,21 @@ func Series(w io.Writer, s Summary, l *query.Listing) error {
 	return nil
 }
 
+// Metadata writes a metadata listing's summary, then one record per metric.
+func Metadata(w io.Writer, s Summary, l *query.MetadataListing) error {
+	enc := newEncoder(w)
+	summary := metadataSummary{summaryHead: headOf(s), Metric: optional(l.Metric), Empty: emptyOf(l.Empty)}
+	if err := enc.Encode(summary); err != nil {
+		return err
+	}
+	for _, m := range l.Metadata {
+		if err := enc.Encode(metadataRecord{Kind: "metadata", Metric: m.Metric, Type: m.Type, Help: m.Help, Unit: m.Unit}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Labels writes a label listing's summary, then one labels record.
 func Labels(w io.Writer, s Summary, l *query.Listing) error {
 	enc := newEncoder(w)
@@ -357,6 +372,21 @@ type truncatedRec struct {
 	Limit string `json:"limit"`
 	Value int    `json:"value"`
 	Full  int    `json:"full"`
+}
+
+type metadataSummary struct {
+	summaryHead
+	// Metric is the metric the listing was narrowed to, or null for every metric.
+	Metric *string   `json:"metric"`
+	Empty  *emptyRec `json:"empty"`
+}
+
+type metadataRecord struct {
+	Kind   string `json:"kind"`
+	Metric string `json:"metric"`
+	Type   string `json:"type"`
+	Help   string `json:"help"`
+	Unit   string `json:"unit"`
 }
 
 type emptyRec struct {

@@ -20,8 +20,10 @@ import (
 	"slices"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
@@ -163,12 +165,17 @@ var Pods = [][2]string{{"shop", "cart-1"}, {"shop", "checkout-1"}, {"shop", NoLi
 // NoLimitPod is the pod in the shop namespace that has no limit series.
 const NoLimitPod = "checkout-2"
 
+// VMs are the KubeVirt virtual machines Named writes as namespace/name pairs, each with a / and a /data
+// filesystem.
+var VMs = [][2]string{{"vms", "db-1"}, {"vms", "web-1"}}
+
 // Nodes are the node-exporter instances Named writes.
 var Nodes = []string{"node-1.example.com", "node-2.example.com"}
 
 // Named writes a TSDB into dir that holds only a WAL, with the series the named queries read: cAdvisor and
-// kube-state-metrics series for Pods, and node-exporter series for Nodes, each scraped every 15s from Start for
-// WideSpan. Counters rise by a fixed amount per scrape.
+// kube-state-metrics series for Pods, node-exporter series and OpenShift's recording rules over them for Nodes,
+// and KubeVirt filesystem series for VMs, each scraped every 15s from Start for WideSpan. Counters rise by a fixed
+// amount per scrape.
 func Named(ctx context.Context, dir string) (err error) {
 	db, err := tsdb.Open(dir, nil, nil, tsdb.DefaultOptions(), nil)
 	if err != nil {
@@ -212,6 +219,25 @@ func Named(ctx context.Context, dir string) (err error) {
 		}
 		add(0.3, true, "__name__", "node_disk_write_time_seconds_total", "instance", instance, "device", "sda")
 		add(100, true, "__name__", "node_disk_writes_completed_total", "instance", instance, "device", "sda")
+		for _, name := range []string{
+			"instance:node_cpu_utilisation:rate1m", "instance:node_memory_utilisation:ratio",
+			"instance:node_network_receive_bytes_excluding_lo:rate1m", "instance:node_network_transmit_bytes_excluding_lo:rate1m",
+			"instance:node_network_receive_drop_excluding_lo:rate1m", "instance:node_network_transmit_drop_excluding_lo:rate1m",
+		} {
+			add(0.25, false, "__name__", name, "instance", instance)
+		}
+		for _, name := range []string{
+			"instance_device:node_disk_io_time_seconds:rate1m", "instance_device:node_disk_io_time_weighted_seconds:rate1m",
+		} {
+			add(0.1, false, "__name__", name, "instance", instance, "device", "sda")
+		}
+	}
+	for _, vm := range VMs {
+		for _, mount := range []string{"/", "/data"} {
+			vmi := []string{"namespace", vm[0], "name", vm[1], "mount_point", mount, "pod", "virt-launcher-" + vm[1]}
+			add(3e9, false, append([]string{"__name__", "kubevirt_vmi_filesystem_used_bytes"}, vmi...)...)
+			add(10e9, false, append([]string{"__name__", "kubevirt_vmi_filesystem_capacity_bytes"}, vmi...)...)
+		}
 	}
 
 	for i, t := 0, Start(); !t.After(Start().Add(WideSpan)); i, t = i+1, t.Add(15*time.Second) {
@@ -224,6 +250,47 @@ func Named(ctx context.Context, dir string) (err error) {
 			if _, err := app.Append(0, s.labels, t.UnixMilli(), v); err != nil {
 				return errors.Join(fmt.Errorf("append fixture sample: %w", err), app.Rollback())
 			}
+		}
+		if err := app.Commit(); err != nil {
+			return fmt.Errorf("commit fixture samples: %w", err)
+		}
+	}
+	return nil
+}
+
+// MetadataMetrics are the metrics Metadata writes, each with its type, unit and help.
+var MetadataMetrics = []struct{ Name, Type, Unit, Help string }{
+	{"node_load1", "gauge", "", "1m load average."},
+	{"node_network_receive_bytes_total", "counter", "bytes", "Network device statistic receive_bytes."},
+}
+
+// Metadata writes a TSDB into dir that holds only a WAL, written with Prometheus's metadata-wal-records feature on:
+// one series of each of MetadataMetrics, scraped every 15s for an hour from Start, with its metadata, and one
+// series of up with none.
+func Metadata(ctx context.Context, dir string) (err error) {
+	opts := tsdb.DefaultOptions()
+	opts.EnableMetadataWALRecords = true
+	db, err := tsdb.Open(dir, nil, nil, opts, nil)
+	if err != nil {
+		return fmt.Errorf("open fixture TSDB: %w", err)
+	}
+	defer func() { err = errors.Join(err, db.Close()) }()
+	db.DisableCompactions()
+
+	for t := Start(); !t.After(Start().Add(time.Hour)); t = t.Add(15 * time.Second) {
+		app := db.Appender(ctx)
+		for _, m := range MetadataMetrics {
+			ls := labels.FromStrings("__name__", m.Name, "instance", "node-1.example.com")
+			ref, err := app.Append(0, ls, t.UnixMilli(), 1)
+			if err == nil && t.Equal(Start()) {
+				_, err = app.UpdateMetadata(ref, ls, metadata.Metadata{Type: model.MetricType(m.Type), Unit: m.Unit, Help: m.Help})
+			}
+			if err != nil {
+				return errors.Join(fmt.Errorf("append fixture sample: %w", err), app.Rollback())
+			}
+		}
+		if _, err := app.Append(0, labels.FromStrings("__name__", "up", "instance", "node-1.example.com"), t.UnixMilli(), 1); err != nil {
+			return errors.Join(fmt.Errorf("append fixture sample: %w", err), app.Rollback())
 		}
 		if err := app.Commit(); err != nil {
 			return fmt.Errorf("commit fixture samples: %w", err)

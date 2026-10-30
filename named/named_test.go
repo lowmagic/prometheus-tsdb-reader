@@ -12,7 +12,7 @@ func TestShippedLoads(t *testing.T) {
 		t.Fatalf("Parse(Shipped()) = %v", err)
 	}
 	want := []string{"pod-cpu", "pod-memory", "node-cpu", "node-iowait", "node-load", "node-memory", "node-network",
-		"node-disk-write-latency"}
+		"node-disk-write-latency", "node-rules", "vm-filesystem"}
 	if got := f.Names(); !slices.Equal(got, want) {
 		t.Errorf("Parse(Shipped()).Names() = %v, want %v", got, want)
 	}
