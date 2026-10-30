@@ -89,3 +89,13 @@ matcher free of escapes inside a JSON string, so YAML would buy nothing for its 
 reach the expression as text: the tool parses the file's PromQL with Prometheus's parser, adds matchers to the
 syntax tree and prints it back, so escaping is the parser's and there is no string templating to get wrong.
 The file's shape is interface, and changing it is an interface change.
+
+## ADR-005: Go 1.26.10, not the current release
+
+The org's Go standard has `go.mod`'s `go` line name the current release, which is 1.27.3. This repo names
+1.26.10 instead, because the host the binary is mainly built on runs Go 1.26.10 with `GOTOOLCHAIN=local`, which
+refuses a module that asks for a newer toolchain, and nothing needs 1.27: the highest `go` line in the module
+graph is 1.26.0, Prometheus v0.315.1's included. It's still an exact version, as the pins table asks of a tool.
+
+This changes when the build host's Go moves, or when a dependency bump (most likely Prometheus's, under ADR-003)
+needs a newer Go; `go get` raises the line then, and this record goes with it.
