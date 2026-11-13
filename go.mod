@@ -1,4 +1,4 @@
-module github.com/junglestyle/prometheus-tsdb-reader
+module github.com/nathancurry/prometheus-tsdb-reader
 
 go 1.26.10
 

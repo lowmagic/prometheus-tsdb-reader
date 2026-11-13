@@ -25,7 +25,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/wlog"
 
-	"github.com/junglestyle/prometheus-tsdb-reader/dump"
+	"github.com/nathancurry/prometheus-tsdb-reader/dump"
 )
 
 // WAL states, as the summary reports them.

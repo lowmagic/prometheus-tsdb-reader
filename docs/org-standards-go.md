@@ -1,7 +1,7 @@
-<!-- junglestyle/.github code-standards/go.md at b3d3bb1eb1b997100738fb5bb9dd2a2b9f45a9d4. Change it there, then run make sync-standards. -->
+<!-- lowmagic/.github code-standards/go.md at 8401afa7edb4cc2232fdd0972fe079123e6c5002. Change it there, then run make sync-standards. -->
 # Go standards
 
-Decisions for Go code, beneath the org [standards](https://github.com/junglestyle/.github/blob/main/code-standards/README.md). `.golangci.yml` holds the mechanical rules; this file holds what a linter can't check. No junglestyle repo uses Go yet, so every rule here comes from the sources below and the org standards, not from practice.
+Decisions for Go code, beneath the org [standards](https://github.com/lowmagic/.github/blob/main/code-standards/README.md). `.golangci.yml` holds the mechanical rules; this file holds what a linter can't check. No lowmagic repo uses Go yet, so every rule here comes from the sources below and the org standards, not from practice.
 
 ## Errors
 

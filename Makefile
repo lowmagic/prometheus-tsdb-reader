@@ -1,6 +1,6 @@
 .PHONY: check build standards sync-standards
 SHELL := bash
-ORG = https://github.com/junglestyle/.github
+ORG = https://github.com/lowmagic/.github
 
 check: build
 	golangci-lint run
