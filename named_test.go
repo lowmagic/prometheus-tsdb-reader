@@ -15,8 +15,8 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 
-	"github.com/nathancurry/prometheus-tsdb-reader/internal/fixture"
-	"github.com/nathancurry/prometheus-tsdb-reader/named"
+	"github.com/lowmagic/prometheus-tsdb-reader/internal/fixture"
+	"github.com/lowmagic/prometheus-tsdb-reader/named"
 )
 
 // writeNamed writes the fixture carrying the named queries' series.

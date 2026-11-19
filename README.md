@@ -53,7 +53,9 @@ prometheus-tsdb-reader --dump ./dump.tar.gz --scratch /tmp/work query range \
 
 Each command prints a summary line first, then one JSON record per series; progress goes to stderr. Times
 default to the dump's end, not to now. An archive is extracted once under `--scratch`, and pointing `--dump`
-at that directory skips the extraction on later runs. The [specification](docs/SPEC.md) lists every command,
+at that directory skips the extraction on later runs. To build a synthetic Prometheus 2.55 archive and a
+damaged copy to try those commands against (needs Docker or Podman and Python 3), run
+[`examples/make-dump.sh`](examples/make-dump.sh). The [specification](docs/SPEC.md) lists every command,
 flag, default, warning and empty reason; the [roadmap](docs/ROADMAP.md) gives the order they get built in;
 and [stack and decisions](docs/stack.md) records why it's Go on Prometheus's own packages. The packages under
 the CLI are a public Go API.

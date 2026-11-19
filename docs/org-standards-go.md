@@ -1,7 +1,7 @@
-<!-- lowmagic/.github code-standards/go.md at 8401afa7edb4cc2232fdd0972fe079123e6c5002. Change it there, then run make sync-standards. -->
+<!-- lowmagic/.github code-standards/go.md at cca8c65ba8c04cfe250b83b91ba69947f014e082. Change it there, then run make sync-standards. -->
 # Go standards
 
-Decisions for Go code, beneath the org [standards](https://github.com/lowmagic/.github/blob/main/code-standards/README.md). `.golangci.yml` holds the mechanical rules; this file holds what a linter can't check. No lowmagic repo uses Go yet, so every rule here comes from the sources below and the org standards, not from practice.
+Decisions for Go code, beneath the org [standards](https://github.com/lowmagic/.github/blob/main/code-standards/README.md). `.golangci.yml` holds the mechanical rules; this file holds what a linter can't check.
 
 ## Errors
 
@@ -18,8 +18,8 @@ Decisions for Go code, beneath the org [standards](https://github.com/lowmagic/.
 
 ## Layout
 
-- One module per repo. `go.mod`'s `go` line names the current release.
-- A module's version is its `vX.Y.Z` tag, so it has no manifest version to keep at `0.0.0` or to check a tag against: before its first release it has no tag. From `v2` on, the module path ends in `/vN`, as Go requires. Code that reports the version reads it with `debug.ReadBuildInfo`.
+- One module per repo. `go.mod`'s `go` line names the current release, or an older one when an ADR names the version, why it's needed, and what would move it forward. Either way it's an exact version, per [Versions and pins](https://github.com/lowmagic/.github/blob/main/code-standards/README.md#versions-and-pins).
+- A module's version is its `vX.Y.Z` tag. From `v2` on, the module path ends in `/vN`, as Go requires. Code that reports the version reads it with `debug.ReadBuildInfo`.
 - One binary: `package main` at the root. Several: `cmd/<name>/main.go` each.
 - Packages that aren't a public API live under `internal/`. No `pkg/` directory.
 - Name a package for what it provides (`queue`, `lease`), never `util`, `common`, `types`, `models` or `helpers`.

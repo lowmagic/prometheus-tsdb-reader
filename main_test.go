@@ -23,8 +23,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/common/model"
 
-	"github.com/nathancurry/prometheus-tsdb-reader/dump"
-	"github.com/nathancurry/prometheus-tsdb-reader/internal/fixture"
+	"github.com/lowmagic/prometheus-tsdb-reader/dump"
+	"github.com/lowmagic/prometheus-tsdb-reader/internal/fixture"
 )
 
 func TestQueryInstant(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/nathancurry/prometheus-tsdb-reader/query"
+	"github.com/lowmagic/prometheus-tsdb-reader/query"
 )
 
 func TestSampleValues(t *testing.T) {

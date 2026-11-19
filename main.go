@@ -17,11 +17,11 @@ import (
 
 	"github.com/prometheus/common/model"
 
-	"github.com/nathancurry/prometheus-tsdb-reader/dump"
-	"github.com/nathancurry/prometheus-tsdb-reader/named"
-	"github.com/nathancurry/prometheus-tsdb-reader/query"
-	"github.com/nathancurry/prometheus-tsdb-reader/render"
-	"github.com/nathancurry/prometheus-tsdb-reader/store"
+	"github.com/lowmagic/prometheus-tsdb-reader/dump"
+	"github.com/lowmagic/prometheus-tsdb-reader/named"
+	"github.com/lowmagic/prometheus-tsdb-reader/query"
+	"github.com/lowmagic/prometheus-tsdb-reader/render"
+	"github.com/lowmagic/prometheus-tsdb-reader/store"
 )
 
 // Exit codes, as the spec's RUN-3 gives them.

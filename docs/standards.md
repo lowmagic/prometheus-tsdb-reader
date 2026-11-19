@@ -1,7 +1,7 @@
 # Coding standards
 
 prometheus-tsdb-reader follows the [org standards](org-standards.md) and the standards for its topics
-([go](org-standards-go.md)), unchanged copies of
+([go](org-standards-go.md), [shell](org-standards-shell.md)), unchanged copies of
 [lowmagic's](https://github.com/lowmagic/.github/tree/main/code-standards). `.org-standards` lists the
 topics it copies beyond the general one. This file adds prometheus-tsdb-reader's own rules and examples.
 Where it differs from an org rule, it says so, and it wins.

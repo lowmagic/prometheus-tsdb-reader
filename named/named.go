@@ -17,7 +17,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 
-	"github.com/nathancurry/prometheus-tsdb-reader/query"
+	"github.com/lowmagic/prometheus-tsdb-reader/query"
 )
 
 //go:embed queries.json

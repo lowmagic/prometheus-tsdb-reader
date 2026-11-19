@@ -10,7 +10,7 @@ import (
 
 	"github.com/prometheus/common/model"
 
-	"github.com/nathancurry/prometheus-tsdb-reader/query"
+	"github.com/lowmagic/prometheus-tsdb-reader/query"
 )
 
 // Summary is what qualifies every result: what ran, over what dump, with which engine, and what the dump is
