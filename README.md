@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/prometheus-tsdb-reader-lockup-dark.svg">
+    <img src="docs/assets/prometheus-tsdb-reader-lockup-light.svg" alt="prometheus-tsdb-reader" width="320">
+  </picture>
+</p>
+
 # prometheus-tsdb-reader
 
 Reads a Prometheus TSDB dump offline and answers PromQL the way Prometheus does.
